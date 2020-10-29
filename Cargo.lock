@@ -811,7 +811,7 @@ checksum = "dc6f3ad7b9d11a0c00842ff8de1b60ee58661048eb8049ed33c73594f359d7e6"
 [[package]]
 name = "jemalloc-sys"
 version = "0.3.2"
-source = "git+https://github.com/silverjam/jemallocator.git#b03e288e138bc442cea53f333ceb037fd1a9a65e"
+source = "git+https://github.com/silverjam/jemallocator.git#b047e0c6c446b9df8aa9bac06898729057d166a6"
 dependencies = [
  "cc",
  "fs_extra",

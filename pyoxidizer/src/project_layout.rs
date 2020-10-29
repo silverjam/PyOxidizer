@@ -311,7 +311,7 @@ pub fn update_new_cargo_toml(path: &Path, pyembed_location: &PyembedLocation) ->
     content.push_str("build = \"build.rs\"\n");
     content.push_str(after);
 
-    content.push_str("jemallocator-global = { version = \"0.3\", optional = true }\n");
+    content.push_str("jemallocator-global = { git = \"https://github.com/silverjam/jemallocator.git\", optional = true }\n");
 
     content.push_str(&format!(
         "pyembed = {{ {}, default-features = false }}\n",
