@@ -3,22 +3,29 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use {
-    crate::environment::{canonicalize_path, MINIMUM_RUST_VERSION},
-    crate::project_layout::initialize_project,
-    crate::py_packaging::binary::{EmbeddedPythonContext, PythonBinaryBuilder},
-    crate::starlark::eval::{eval_starlark_config_file, EvalResult},
-    crate::starlark::target::ResolvedTarget,
+    crate::{
+        environment::{canonicalize_path, MINIMUM_RUST_VERSION},
+        project_layout::initialize_project,
+        py_packaging::{
+            binary::{EmbeddedPythonContext, LibpythonLinkMode, PythonBinaryBuilder},
+            distribution::AppleSdkInfo,
+        },
+        starlark::eval::{EvaluationContext, EvaluationContextBuilder},
+    },
     anyhow::{anyhow, Context, Result},
     duct::cmd,
-    slog::warn,
+    semver::Version,
+    slog::{info, warn},
+    starlark_dialect_build_targets::ResolvedTarget,
     std::{
-        collections::{hash_map::RandomState, HashMap},
+        collections::HashMap,
+        convert::TryInto,
         env,
         fs::create_dir_all,
         io::{BufRead, BufReader},
-        iter::FromIterator,
         path::{Path, PathBuf},
     },
+    tugger_apple::{find_command_line_tools_sdks, find_default_developer_sdks, AppleSdk},
 };
 
 pub const HOST: &str = env!("HOST");
@@ -74,8 +81,304 @@ pub fn find_pyoxidizer_config_file_env(logger: &slog::Logger, start_dir: &Path) 
     find_pyoxidizer_config_file(start_dir)
 }
 
+/// Resolve an appropriate Apple SDK to use.
+pub fn resolve_apple_sdk(
+    logger: &slog::Logger,
+    platform: &str,
+    minimum_version: &str,
+    deployment_target: &str,
+) -> Result<AppleSdk> {
+    if minimum_version.split('.').count() != 2 {
+        return Err(anyhow!(
+            "expected X.Y minimum Apple SDK version; got {}",
+            minimum_version
+        ));
+    }
+
+    let minimum_semver = Version::parse(&format!("{}.0", minimum_version))?;
+
+    let mut sdks = find_default_developer_sdks()
+        .context("discovering Apple SDKs (default developer directory)")?;
+    if let Some(extra_sdks) =
+        find_command_line_tools_sdks().context("discovering Apple SDKs (command line tools)")?
+    {
+        sdks.extend(extra_sdks);
+    }
+
+    let target_sdks = sdks
+        .iter()
+        .filter(|sdk| !sdk.is_symlink && sdk.supported_targets.contains_key(platform))
+        .collect::<Vec<_>>();
+
+    info!(
+        logger,
+        "found {} total Apple SDKs; {} support {}",
+        sdks.len(),
+        target_sdks.len(),
+        platform,
+    );
+
+    let mut candidate_sdks = target_sdks
+        .into_iter()
+        .filter(|sdk| {
+            let version = match sdk.version_as_semver() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            if version < minimum_semver {
+                info!(
+                    logger,
+                    "ignoring SDK {} because it is too old ({} < {})",
+                    sdk.path.display(),
+                    sdk.version,
+                    minimum_version
+                );
+
+                false
+            } else if !sdk
+                .supported_targets
+                .get(platform)
+                // Safe because key was validated above.
+                .unwrap()
+                .valid_deployment_targets
+                .contains(&deployment_target.to_string())
+            {
+                info!(
+                    logger,
+                    "ignoring SDK {} because it doesn't support deployment target {}",
+                    sdk.path.display(),
+                    deployment_target
+                );
+
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    candidate_sdks.sort_by(|a, b| {
+        b.version_as_semver()
+            .unwrap()
+            .cmp(&a.version_as_semver().unwrap())
+    });
+
+    if candidate_sdks.is_empty() {
+        Err(anyhow!(
+            "unable to find suitable Apple SDK supporting {}{} or newer",
+            platform,
+            minimum_version
+        ))
+    } else {
+        info!(
+            logger,
+            "found {} suitable Apple SDKs ({})",
+            candidate_sdks.len(),
+            candidate_sdks
+                .iter()
+                .map(|sdk| sdk.name.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        Ok(candidate_sdks[0].clone())
+    }
+}
+
+/// Describes an environment and settings used to build a project.
+pub struct BuildEnvironment {
+    /// Path to cargo executable to run.
+    pub cargo_exe: String,
+
+    /// Version of Rust being used.
+    pub rust_version: Version,
+
+    /// Environment variables to use in build processes.
+    ///
+    /// This contains a copy of environment variables that were present at
+    /// object creation time, it isn't just a supplemental list.
+    pub environment_vars: HashMap<String, String>,
+}
+
+impl BuildEnvironment {
+    /// Construct a new build environment performing validation of requirements.
+    pub fn new(
+        logger: &slog::Logger,
+        target_triple: &str,
+        artifacts_path: &Path,
+        target_python_path: &Path,
+        libpython_link_mode: LibpythonLinkMode,
+        libpython_filename: Option<&Path>,
+        apple_sdk_info: Option<&AppleSdkInfo>,
+    ) -> Result<Self> {
+        let rust_version = rustc_version::version()?;
+        if rust_version.lt(&MINIMUM_RUST_VERSION) {
+            return Err(anyhow!(
+                "PyOxidizer requires Rust {}; version {} found",
+                *MINIMUM_RUST_VERSION,
+                rust_version
+            ));
+        }
+
+        let mut envs = std::env::vars().collect::<HashMap<_, _>>();
+
+        // Tells any invoked pyoxidizer process where to write build artifacts.
+        envs.insert(
+            "PYOXIDIZER_ARTIFACT_DIR".to_string(),
+            artifacts_path.display().to_string(),
+        );
+
+        // Tells any invoked pyoxidizer process to reuse artifacts if they are up to date.
+        envs.insert("PYOXIDIZER_REUSE_ARTIFACTS".to_string(), "1".to_string());
+
+        // Set PYTHON_SYS_EXECUTABLE so python3-sys uses our distribution's Python to configure
+        // itself.
+        // TODO the build environment requiring use of target arch executable prevents
+        // cross-compiling. We should be able to pass in all state without having to
+        // run an executable in a build script.
+        envs.insert(
+            "PYTHON_SYS_EXECUTABLE".to_string(),
+            target_python_path.display().to_string(),
+        );
+
+        let mut rust_flags = vec![];
+
+        // If linking against an existing dynamic library on Windows, add the path to that
+        // library so the linker can find it.
+        if let Some(libpython_filename) = libpython_filename {
+            if target_triple.contains("-windows-") {
+                let libpython_dir = libpython_filename
+                    .parent()
+                    .ok_or_else(|| anyhow!("unable to find parent directory of python DLL"))?;
+
+                rust_flags.push(format!("-L{}", libpython_dir.display()));
+            }
+        }
+
+        // static-nobundle link kind requires nightly Rust compiler until
+        // https://github.com/rust-lang/rust/issues/37403 is resolved.
+        if target_triple.contains("-windows-") {
+            envs.insert("RUSTC_BOOTSTRAP".to_string(), "1".to_string());
+        }
+
+        // When targeting Apple platforms and using Apple SDKs, you can very
+        // easily run into SDK and toolchain compatibility issues when your
+        // local SDK or toolchain is older than the one used to produce the
+        // Python distribution. For example, if the macosx10.15 SDK is used to
+        // produce the Python distribution and you are using an older version
+        // of Clang that can't parse version 4 .tbd files, the linker will fail
+        // to find which dylibs contain symbols (because mach-o must encode the
+        // name of a dylib containing weakly linked symbols) and you'll get a
+        // linker error for unresolved symbols. See
+        // https://github.com/indygreg/PyOxidizer/issues/373 for a thorough
+        // discussion on this topic.
+        //
+        // Here, we validate that the local SDK being used is >= the version used
+        // by the Python distribution.
+        // TODO validate minimum Clang/linker version as well.
+        if target_triple.contains("-apple-") {
+            let sdk_info = apple_sdk_info.ok_or_else(|| {
+                anyhow!("targeting Apple platform but Apple SDK info not available")
+            })?;
+
+            let platform = &sdk_info.platform;
+            let minimum_version = &sdk_info.version;
+            let deployment_target = &sdk_info.deployment_target;
+
+            // Respect the SDKROOT environment variable.
+            let sdk = if let Some(sdk_root) = envs.get("SDKROOT") {
+                warn!(logger, "SDKROOT defined; using Apple SDK at {}", sdk_root);
+                AppleSdk::from_directory(&PathBuf::from(sdk_root)).with_context(|| {
+                    format!("resolving SDK at {} as defined via SDKROOT", sdk_root)
+                })?
+            } else {
+                warn!(
+                    logger,
+                    "locating Apple SDK {}{}+ supporting {}{}",
+                    platform,
+                    minimum_version,
+                    platform,
+                    deployment_target
+                );
+
+                resolve_apple_sdk(logger, platform, minimum_version, deployment_target)
+                    .context("resolving Apple SDK")?
+            };
+
+            warn!(
+                logger,
+                "using SDK {} ({} targeting {}{})",
+                sdk.path.display(),
+                sdk.name,
+                platform,
+                deployment_target
+            );
+
+            let deployment_target_name = sdk.supported_targets.get(platform).ok_or_else(|| {
+                anyhow!("could not find settings for target {} (this shouldn't happen)", platform)
+            })?.deployment_target_setting_name.as_ref().ok_or_else(|| {
+                anyhow!("unable to identify deployment target environment variable for {} (please report this bug)", platform)
+            })?;
+
+            // SDKROOT will instruct rustc and potentially other tools to use exactly this SDK.
+            envs.insert("SDKROOT".to_string(), sdk.path.display().to_string());
+
+            // This (e.g. MACOSX_DEPLOYMENT_TARGET) will instruct compilers to target a specific
+            // minimum version of the target platform. We respect an explicit value if one
+            // is given.
+            if envs.get(deployment_target_name).is_none() {
+                envs.insert(
+                    deployment_target_name.to_string(),
+                    deployment_target.to_string(),
+                );
+            }
+        }
+
+        // Windows standalone_static distributions require the non-DLL CRT.
+        // This requires telling Rust to use the static CRT.
+        //
+        // In addition, these distributions also have some symbols defined in
+        // multiple object files. See https://github.com/indygreg/python-build-standalone/issues/71.
+        // This can lead to a linker error unless we suppress it via /FORCE:MULTIPLE.
+        // This workaround is not ideal.
+        // TODO remove /FORCE:MULTIPLE once the distributions eliminate duplicate
+        // symbols.
+        if target_triple.contains("-windows-") && libpython_link_mode == LibpythonLinkMode::Static {
+            rust_flags.extend(
+                [
+                    "-C".to_string(),
+                    "target-feature=+crt-static".to_string(),
+                    "-C".to_string(),
+                    "link-args=/FORCE:MULTIPLE".to_string(),
+                ]
+                .iter()
+                .map(|x| x.to_string()),
+            );
+        }
+
+        if !rust_flags.is_empty() {
+            let extra_flags = rust_flags.join(" ");
+
+            envs.insert(
+                "RUSTFLAGS".to_string(),
+                if let Some(value) = envs.get("RUSTFLAGS") {
+                    format!("{} {}", extra_flags, value)
+                } else {
+                    extra_flags
+                },
+            );
+        }
+
+        Ok(Self {
+            cargo_exe: "cargo".to_string(),
+            rust_version,
+            environment_vars: envs,
+        })
+    }
+}
+
 /// Holds results from building an executable.
-pub struct BuiltExecutable {
+pub struct BuiltExecutable<'a> {
     /// Path to built executable file.
     pub exe_path: Option<PathBuf>,
 
@@ -86,24 +389,24 @@ pub struct BuiltExecutable {
     pub exe_data: Vec<u8>,
 
     /// Holds state generated from building.
-    pub binary_data: EmbeddedPythonContext,
+    pub binary_data: EmbeddedPythonContext<'a>,
 }
 
 /// Build an executable embedding Python using an existing Rust project.
 ///
 /// The path to the produced executable is returned.
 #[allow(clippy::too_many_arguments)]
-pub fn build_executable_with_rust_project(
+pub fn build_executable_with_rust_project<'a>(
     logger: &slog::Logger,
     project_path: &Path,
     bin_name: &str,
-    exe: &dyn PythonBinaryBuilder,
+    exe: &'a (dyn PythonBinaryBuilder + 'a),
     build_path: &Path,
     artifacts_path: &Path,
     target: &str,
     opt_level: &str,
     release: bool,
-) -> Result<BuiltExecutable> {
+) -> Result<BuiltExecutable<'a>> {
     create_dir_all(&artifacts_path)
         .with_context(|| "creating directory for PyOxidizer build artifacts")?;
 
@@ -111,15 +414,18 @@ pub fn build_executable_with_rust_project(
     let embedded_data = exe.to_embedded_python_context(logger, opt_level)?;
     embedded_data.write_files(&artifacts_path)?;
 
-    let rust_version = rustc_version::version()?;
-    if rust_version.lt(&MINIMUM_RUST_VERSION) {
-        return Err(anyhow!(
-            "PyOxidizer requires Rust {}; version {} found",
-            *MINIMUM_RUST_VERSION,
-            rust_version
-        ));
-    }
-    warn!(logger, "building with Rust {}", rust_version);
+    let build_env = BuildEnvironment::new(
+        logger,
+        exe.target_triple(),
+        artifacts_path,
+        exe.target_python_exe_path(),
+        exe.libpython_link_mode(),
+        embedded_data.linking_info.libpython_filename.as_deref(),
+        exe.apple_sdk_info(),
+    )
+    .context("resolving build environment")?;
+
+    warn!(logger, "building with Rust {}", build_env.rust_version);
 
     let target_base_path = build_path.join("target");
     let target_triple_base_path =
@@ -127,10 +433,7 @@ pub fn build_executable_with_rust_project(
             .join(target)
             .join(if release { "release" } else { "debug" });
 
-    let mut args = Vec::new();
-    args.push("build");
-    args.push("--target");
-    args.push(target);
+    let mut args = vec!["build", "--target", target];
 
     let target_dir = target_base_path.display().to_string();
     args.push("--target-dir");
@@ -155,7 +458,16 @@ pub fn build_executable_with_rust_project(
     });
 
     if exe.requires_jemalloc() {
-        features.push("jemalloc");
+        features.push("global-allocator-jemalloc");
+        features.push("allocator-jemalloc");
+    }
+    if exe.requires_mimalloc() {
+        features.push("global-allocator-mimalloc");
+        features.push("allocator-mimalloc");
+    }
+    if exe.requires_snmalloc() {
+        features.push("global-allocator-snmalloc");
+        features.push("allocator-snmalloc");
     }
 
     let features = features.join(" ");
@@ -165,55 +477,13 @@ pub fn build_executable_with_rust_project(
         args.push(&features);
     }
 
-    let mut envs: HashMap<String, String, RandomState> = HashMap::from_iter(std::env::vars());
-    envs.insert(
-        "PYOXIDIZER_ARTIFACT_DIR".to_string(),
-        artifacts_path.display().to_string(),
-    );
-    envs.insert("PYOXIDIZER_REUSE_ARTIFACTS".to_string(), "1".to_string());
-
-    // Set PYTHON_SYS_EXECUTABLE so python3-sys uses our distribution's Python to configure
-    // itself.
-    // TODO the build environment requiring use of target arch executable prevents
-    // cross-compiling. We should be able to pass in all state without having to
-    // run an executable in a build script.
-    let python_exe_path = exe.target_python_exe_path();
-    envs.insert(
-        "PYTHON_SYS_EXECUTABLE".to_string(),
-        python_exe_path.display().to_string(),
-    );
-
-    // If linking against an existing dynamic library on Windows, add the path to that
-    // library to an environment variable so link.exe can find it.
-    if let Some(libpython_filename) = &embedded_data.linking_info.libpython_filename {
-        if cfg!(windows) {
-            let libpython_dir = libpython_filename
-                .parent()
-                .ok_or_else(|| anyhow!("unable to find parent directory of python DLL"))?;
-
-            envs.insert(
-                "LIB".to_string(),
-                if let Ok(lib) = std::env::var("LIB") {
-                    format!("{};{}", lib, libpython_dir.display())
-                } else {
-                    format!("{}", libpython_dir.display())
-                },
-            );
-        }
-    }
-
-    // static-nobundle link kind requires nightly Rust compiler until
-    // https://github.com/rust-lang/rust/issues/37403 is resolved.
-    if cfg!(windows) {
-        envs.insert("RUSTC_BOOTSTRAP".to_string(), "1".to_string());
-    }
-
     // TODO force cargo to colorize output under certain circumstances?
-    let command = cmd("cargo", &args)
+    let command = cmd(build_env.cargo_exe, &args)
         .dir(&project_path)
-        .full_env(&envs)
+        .full_env(&build_env.environment_vars)
         .stderr_to_stdout()
-        .reader()?;
+        .reader()
+        .context("invoking cargo command")?;
     {
         let reader = BufReader::new(&command);
         for line in reader.lines() {
@@ -253,25 +523,31 @@ pub fn build_executable_with_rust_project(
 /// Build a Python executable using a temporary Rust project.
 ///
 /// Returns the binary data constituting the built executable.
-pub fn build_python_executable(
+pub fn build_python_executable<'a>(
     logger: &slog::Logger,
     bin_name: &str,
-    exe: &dyn PythonBinaryBuilder,
+    exe: &'a (dyn PythonBinaryBuilder + 'a),
     target: &str,
     opt_level: &str,
     release: bool,
-) -> Result<BuiltExecutable> {
+) -> Result<BuiltExecutable<'a>> {
     let env = crate::environment::resolve_environment()?;
     let pyembed_location = env.as_pyembed_location();
 
-    let temp_dir = tempdir::TempDir::new("pyoxidizer")?;
+    let temp_dir = tempfile::Builder::new().prefix("pyoxidizer").tempdir()?;
 
     // Directory needs to have name of project.
     let project_path = temp_dir.path().join(bin_name);
     let build_path = temp_dir.path().join("build");
     let artifacts_path = temp_dir.path().join("artifacts");
 
-    initialize_project(&project_path, &pyembed_location, None, &[])?;
+    initialize_project(
+        &project_path,
+        &pyembed_location,
+        None,
+        &[],
+        exe.windows_subsystem(),
+    )?;
 
     let mut build = build_executable_with_rust_project(
         logger,
@@ -312,23 +588,22 @@ pub fn build_pyembed_artifacts(
         return Ok(());
     }
 
-    let mut res: EvalResult = eval_starlark_config_file(
-        logger,
-        config_path,
-        target_triple,
-        release,
-        verbose,
-        if let Some(target) = resolve_target {
-            Some(vec![target.to_string()])
-        } else {
-            None
-        },
-        true,
-    )?;
+    let mut context: EvaluationContext = EvaluationContextBuilder::new(
+        logger.clone(),
+        config_path.to_path_buf(),
+        target_triple.to_string(),
+    )
+    .release(release)
+    .verbose(verbose)
+    .resolve_target_optional(resolve_target)
+    .build_script_mode(true)
+    .try_into()?;
+
+    context.evaluate_file(config_path)?;
 
     // TODO should we honor only the specified target if one is given?
-    for target in res.context.targets_to_resolve() {
-        let resolved: ResolvedTarget = res.context.build_resolved_target(&target)?;
+    for target in context.targets_to_resolve()? {
+        let resolved: ResolvedTarget = context.build_resolved_target(&target)?;
 
         let cargo_metadata = resolved.output_path.join("cargo_metadata.txt");
 
@@ -535,14 +810,165 @@ fn artifacts_current(logger: &slog::Logger, config_path: &Path, artifacts_path: 
 mod tests {
     use {
         super::*,
-        crate::py_packaging::standalone_builder::tests::StandalonePythonExecutableBuilderOptions,
-        crate::testutil::*,
+        crate::{
+            py_packaging::standalone_builder::tests::StandalonePythonExecutableBuilderOptions,
+            testutil::*,
+        },
+        python_packaging::interpreter::MemoryAllocatorBackend,
     };
+
+    #[cfg(target_env = "msvc")]
+    use crate::py_packaging::distribution::DistributionFlavor;
 
     #[test]
     fn test_empty_project() -> Result<()> {
         let logger = get_logger()?;
         let options = StandalonePythonExecutableBuilderOptions::default();
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    // Skip on aarch64-apple-darwin because we don't have 3.8 builds.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn test_empty_project_python_38() -> Result<()> {
+        let logger = get_logger()?;
+        let options = StandalonePythonExecutableBuilderOptions {
+            distribution_version: Some("3.8".to_string()),
+            ..Default::default()
+        };
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_env = "msvc")]
+    fn test_empty_project_standalone_static() -> Result<()> {
+        let logger = get_logger()?;
+        let options = StandalonePythonExecutableBuilderOptions {
+            distribution_flavor: DistributionFlavor::StandaloneStatic,
+            ..Default::default()
+        };
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_env = "msvc")]
+    fn test_empty_project_standalone_static_38() -> Result<()> {
+        let logger = get_logger()?;
+        let options = StandalonePythonExecutableBuilderOptions {
+            distribution_version: Some("3.8".to_string()),
+            distribution_flavor: DistributionFlavor::StandaloneStatic,
+            ..Default::default()
+        };
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    // Not supported on Windows.
+    #[cfg(not(target_env = "msvc"))]
+    fn test_allocator_jemalloc() -> Result<()> {
+        let logger = get_logger()?;
+
+        let mut options = StandalonePythonExecutableBuilderOptions::default();
+        options.config.allocator_backend = MemoryAllocatorBackend::Jemalloc;
+
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocator_mimalloc() -> Result<()> {
+        // cmake required to build.
+        if cfg!(windows) {
+            eprintln!("skipping on Windows due to build sensitivity");
+            return Ok(());
+        }
+
+        let logger = get_logger()?;
+
+        let mut options = StandalonePythonExecutableBuilderOptions::default();
+        options.config.allocator_backend = MemoryAllocatorBackend::Mimalloc;
+
+        let pre_built = options.new_builder()?;
+
+        build_python_executable(
+            &logger,
+            "myapp",
+            pre_built.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocator_snmalloc() -> Result<()> {
+        // cmake required to build.
+        if cfg!(windows) {
+            eprintln!("skipping on Windows due to build sensitivity");
+            return Ok(());
+        }
+
+        let logger = get_logger()?;
+
+        let mut options = StandalonePythonExecutableBuilderOptions::default();
+        options.config.allocator_backend = MemoryAllocatorBackend::Snmalloc;
+
         let pre_built = options.new_builder()?;
 
         build_python_executable(

@@ -11,8 +11,8 @@ use {
     itertools::Itertools,
     python_packaging::{
         interpreter::{
-            Allocator, BytesWarning, CheckHashPYCsMode, CoerceCLocale, MemoryAllocatorBackend,
-            PythonInterpreterConfig, PythonInterpreterProfile, PythonRunMode, TerminfoResolution,
+            Allocator, BytesWarning, CheckHashPycsMode, CoerceCLocale, MemoryAllocatorBackend,
+            PythonInterpreterConfig, PythonInterpreterProfile, TerminfoResolution,
         },
         resource::BytecodeOptimizationLevel,
     },
@@ -22,14 +22,14 @@ use {
     },
 };
 
-/// Determine the default raw allocator for a target triple.
-pub fn default_raw_allocator(target_triple: &str) -> MemoryAllocatorBackend {
+/// Determine the default memory allocator for a target triple.
+pub fn default_memory_allocator(target_triple: &str) -> MemoryAllocatorBackend {
     // Jemalloc doesn't work on Windows.
     //
     // We don't use Jemalloc by default in the test environment because it slows down
     // builds of test projects.
-    if target_triple == "x86_64-pc-windows-msvc" || cfg!(test) {
-        MemoryAllocatorBackend::System
+    if target_triple.ends_with("-pc-windows-msvc") || cfg!(test) {
+        MemoryAllocatorBackend::Default
     } else {
         MemoryAllocatorBackend::Jemalloc
     }
@@ -44,14 +44,21 @@ fn optional_bool_to_string(value: &Option<bool>) -> String {
 
 fn optional_string_to_string(value: &Option<String>) -> String {
     match value {
-        Some(value) => format_args!("Some(\"{}\")", value).to_string(),
+        Some(value) => format!("Some(\"{}\".to_string())", value.escape_default()),
         None => "None".to_string(),
     }
 }
 
+fn path_to_string(value: &Path) -> String {
+    format!(
+        "std::path::PathBuf::from(\"{}\")",
+        value.display().to_string().escape_default()
+    )
+}
+
 fn optional_pathbuf_to_string(value: &Option<PathBuf>) -> String {
     match value {
-        Some(value) => format_args!("Some(PathBuf::from(\"{}\"", value.display()).to_string(),
+        Some(value) => format!("Some({})", path_to_string(value)),
         None => "None".to_string(),
     }
 }
@@ -59,14 +66,44 @@ fn optional_pathbuf_to_string(value: &Option<PathBuf>) -> String {
 fn optional_vec_string_to_string(value: &Option<Vec<String>>) -> String {
     match value {
         Some(value) => format!(
-            "Some({})",
+            "Some(vec![{}])",
             value
                 .iter()
-                .map(|x| format_args!("\"{}\"", x).to_string())
+                .map(|x| format!("\"{}\".to_string()", x.escape_default()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
         None => "None".to_string(),
+    }
+}
+
+/// Represents sources for loading packed resources data.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PyembedPackedResourcesSource {
+    /// Load from memory via an `include_bytes!` directive.
+    MemoryIncludeBytes(PathBuf),
+    /// Load from a file using memory mapped I/O.
+    ///
+    /// The string `$ORIGIN` is expanded at runtime.
+    MemoryMappedPath(PathBuf),
+}
+
+impl ToString for PyembedPackedResourcesSource {
+    fn to_string(&self) -> String {
+        match self {
+            Self::MemoryIncludeBytes(path) => {
+                format!(
+                    "pyembed::PackedResourcesSource::Memory(include_bytes!(r#\"{}\"#))",
+                    path.display()
+                )
+            }
+            Self::MemoryMappedPath(path) => {
+                format!(
+                    "pyembed::PackedResourcesSource::MemoryMappedPath({})",
+                    path_to_string(&path)
+                )
+            }
+        }
     }
 }
 
@@ -77,22 +114,29 @@ fn optional_vec_string_to_string(value: &Option<Vec<String>>) -> String {
 /// But that type holds a reference to resources data and this type needs to
 /// be embedded in Starlark values, which have a `static lifetime.
 #[derive(Clone, Debug, PartialEq)]
-pub struct EmbeddedPythonConfig {
+pub struct PyembedPythonInterpreterConfig {
     pub config: PythonInterpreterConfig,
-    pub raw_allocator: MemoryAllocatorBackend,
+    pub allocator_backend: MemoryAllocatorBackend,
+    pub allocator_raw: bool,
+    pub allocator_mem: bool,
+    pub allocator_obj: bool,
+    pub allocator_pymalloc_arena: bool,
+    pub allocator_debug: bool,
+    pub set_missing_path_configuration: bool,
     pub oxidized_importer: bool,
     pub filesystem_importer: bool,
+    pub packed_resources: Vec<PyembedPackedResourcesSource>,
     pub argvb: bool,
     pub sys_frozen: bool,
     pub sys_meipass: bool,
     pub terminfo_resolution: TerminfoResolution,
+    pub tcl_library: Option<PathBuf>,
     pub write_modules_directory_env: Option<String>,
-    pub run_mode: PythonRunMode,
 }
 
-impl Default for EmbeddedPythonConfig {
+impl Default for PyembedPythonInterpreterConfig {
     fn default() -> Self {
-        EmbeddedPythonConfig {
+        PyembedPythonInterpreterConfig {
             config: PythonInterpreterConfig {
                 profile: PythonInterpreterProfile::Isolated,
                 // Isolated mode disables configure_locale by default. But this
@@ -103,25 +147,31 @@ impl Default for EmbeddedPythonConfig {
                 configure_locale: Some(true),
                 ..PythonInterpreterConfig::default()
             },
-            raw_allocator: MemoryAllocatorBackend::System,
+            allocator_backend: MemoryAllocatorBackend::Default,
+            // This setting has no effect by itself. But the default of true
+            // makes it so a custom backend is used automatically.
+            allocator_raw: true,
+            allocator_mem: false,
+            allocator_obj: false,
+            allocator_pymalloc_arena: false,
+            allocator_debug: false,
+            set_missing_path_configuration: true,
             oxidized_importer: true,
             filesystem_importer: false,
+            packed_resources: vec![],
             argvb: false,
             sys_frozen: false,
             sys_meipass: false,
             terminfo_resolution: TerminfoResolution::None,
+            tcl_library: None,
             write_modules_directory_env: None,
-            run_mode: PythonRunMode::Repl,
         }
     }
 }
 
-impl EmbeddedPythonConfig {
+impl PyembedPythonInterpreterConfig {
     /// Convert the instance to Rust code that constructs a `pyembed::OxidizedPythonInterpreterConfig`.
-    pub fn to_oxidized_python_interpreter_config_rs(
-        &self,
-        packed_resources_path: Option<&Path>,
-    ) -> Result<String> {
+    pub fn to_oxidized_python_interpreter_config_rs(&self) -> Result<String> {
         let code = format!(
             "pyembed::OxidizedPythonInterpreterConfig {{\n    \
             exe: None,\n    \
@@ -172,7 +222,6 @@ impl EmbeddedPythonConfig {
             run_command: {},\n        \
             run_filename: {},\n        \
             run_module: {},\n        \
-            show_alloc_count: {},\n        \
             show_ref_count: {},\n        \
             site_import: {},\n        \
             skip_first_source_line: {},\n        \
@@ -185,8 +234,13 @@ impl EmbeddedPythonConfig {
             write_bytecode: {},\n        \
             x_options: {},\n        \
             }},\n    \
-            raw_allocator: Some({}),\n    \
-            set_missing_path_configuration: true,\n    \
+            allocator_backend: {},\n    \
+            allocator_raw: {},\n    \
+            allocator_mem: {},\n    \
+            allocator_obj: {},\n    \
+            allocator_pymalloc_arena: {},\n    \
+            allocator_debug: {},\n    \
+            set_missing_path_configuration: {},\n    \
             oxidized_importer: {},\n    \
             filesystem_importer: {},\n    \
             packed_resources: {},\n    \
@@ -196,8 +250,8 @@ impl EmbeddedPythonConfig {
             sys_frozen: {},\n    \
             sys_meipass: {},\n    \
             terminfo_resolution: {},\n    \
+            tcl_library: {},\n    \
             write_modules_directory_env: {},\n    \
-            run: {},\n\
             }}\n\
             ",
             match self.config.profile {
@@ -238,9 +292,9 @@ impl EmbeddedPythonConfig {
                 None => "None",
             },
             match self.config.check_hash_pycs_mode {
-                Some(CheckHashPYCsMode::Always) => "Some(pyembed::CheckHashPYCsMode::Always)",
-                Some(CheckHashPYCsMode::Default) => "Some(pyembed::CheckHashPYCsMode::Default)",
-                Some(CheckHashPYCsMode::Never) => "Some(pyembed::CheckHashPYCsMode::Never)",
+                Some(CheckHashPycsMode::Always) => "Some(pyembed::CheckHashPycsMode::Always)",
+                Some(CheckHashPycsMode::Default) => "Some(pyembed::CheckHashPycsMode::Default)",
+                Some(CheckHashPycsMode::Never) => "Some(pyembed::CheckHashPycsMode::Never)",
                 None => "None",
             },
             optional_bool_to_string(&self.config.configure_c_stdio),
@@ -267,10 +321,7 @@ impl EmbeddedPythonConfig {
                         "Some(vec![{}])",
                         paths
                             .iter()
-                            .map(
-                                |p| format_args!("std::path::PathBuf::from(\"{}\")", p.display())
-                                    .to_string()
-                            )
+                            .map(|p| path_to_string(p.as_path()))
                             .collect::<Vec<String>>()
                             .join(", ")
                     )
@@ -296,7 +347,6 @@ impl EmbeddedPythonConfig {
             optional_string_to_string(&self.config.run_command),
             optional_pathbuf_to_string(&self.config.run_filename),
             optional_string_to_string(&self.config.run_module),
-            optional_bool_to_string(&self.config.show_alloc_count),
             optional_bool_to_string(&self.config.show_ref_count),
             optional_bool_to_string(&self.config.site_import),
             optional_bool_to_string(&self.config.skip_first_source_line),
@@ -308,18 +358,28 @@ impl EmbeddedPythonConfig {
             optional_vec_string_to_string(&self.config.warn_options),
             optional_bool_to_string(&self.config.write_bytecode),
             optional_vec_string_to_string(&self.config.x_options),
-            match self.raw_allocator {
-                MemoryAllocatorBackend::Jemalloc => "pyembed::PythonRawAllocator::jemalloc()",
-                MemoryAllocatorBackend::Rust => "pyembed::PythonRawAllocator::rust()",
-                MemoryAllocatorBackend::System => "pyembed::PythonRawAllocator::system()",
+            match self.allocator_backend {
+                MemoryAllocatorBackend::Jemalloc => "pyembed::MemoryAllocatorBackend::Jemalloc",
+                MemoryAllocatorBackend::Mimalloc => "pyembed::MemoryAllocatorBackend::Mimalloc",
+                MemoryAllocatorBackend::Snmalloc => "pyembed::MemoryAllocatorBackend::Snmalloc",
+                MemoryAllocatorBackend::Rust => "pyembed::MemoryAllocatorBackend::Rust",
+                MemoryAllocatorBackend::Default => "pyembed::MemoryAllocatorBackend::Default",
             },
+            self.allocator_raw,
+            self.allocator_mem,
+            self.allocator_obj,
+            self.allocator_pymalloc_arena,
+            self.allocator_debug,
+            self.set_missing_path_configuration,
             self.oxidized_importer,
             self.filesystem_importer,
-            if let Some(path) = packed_resources_path {
-                format!("vec![include_bytes!(r#\"{}\"#)]", path.display())
-            } else {
-                "vec![]".to_string()
-            },
+            format!(
+                "vec![{}]",
+                self.packed_resources
+                    .iter()
+                    .map(|e| e.to_string())
+                    .join(", ")
+            ),
             self.argvb,
             self.sys_frozen,
             self.sys_meipass,
@@ -330,40 +390,19 @@ impl EmbeddedPythonConfig {
                     format!("pyembed::TerminfoResolution::Static(r###\"{}\"###", v)
                 }
             },
+            optional_pathbuf_to_string(&self.tcl_library),
             optional_string_to_string(&self.write_modules_directory_env),
-            match self.run_mode {
-                PythonRunMode::None => "pyembed::PythonRunMode::None".to_owned(),
-                PythonRunMode::Repl => "pyembed::PythonRunMode::Repl".to_owned(),
-                PythonRunMode::Module { ref module } => {
-                    "pyembed::PythonRunMode::Module { module: \"".to_owned()
-                        + module
-                        + "\".to_string() }"
-                }
-                PythonRunMode::Eval { ref code } => {
-                    "pyembed::PythonRunMode::Eval { code: r###\"".to_owned()
-                        + code
-                        + "\"###.to_string() }"
-                }
-                PythonRunMode::File { ref path } => {
-                    format!("pyembed::PythonRunMode::File {{ path: std::path::PathBuf::new(r###\"{}\"###) }}",
-                    path.display())
-                }
-            },
         );
 
         Ok(code)
     }
 
     /// Write a Rust file containing a function for obtaining the default `OxidizedPythonInterpreterConfig`.
-    pub fn write_default_python_confis_rs(
-        &self,
-        path: &Path,
-        packed_resources_path: Option<&Path>,
-    ) -> Result<()> {
-        let mut f = std::fs::File::create(&path)?;
+    pub fn write_default_python_config_rs(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut f = std::fs::File::create(path.as_ref())?;
 
         let indented = self
-            .to_oxidized_python_interpreter_config_rs(packed_resources_path)?
+            .to_oxidized_python_interpreter_config_rs()?
             .split('\n')
             .map(|line| "    ".to_string() + line)
             .join("\n");
@@ -384,17 +423,180 @@ impl EmbeddedPythonConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::py_packaging::distribution::{BinaryLibpythonLinkMode, PythonDistribution};
+    use {super::*, crate::testutil::*};
+
+    fn assert_contains(haystack: &str, needle: &str) -> Result<()> {
+        assert!(
+            haystack.contains(needle),
+            "expected to find {} in {}",
+            needle,
+            haystack
+        );
+
+        Ok(())
+    }
+
+    fn assert_serialize_module_search_paths(paths: &[&str], expected_contents: &str) -> Result<()> {
+        let mut config = PyembedPythonInterpreterConfig::default();
+        config.config.module_search_paths = Some(paths.iter().map(PathBuf::from).collect());
+
+        let code = config.to_oxidized_python_interpreter_config_rs()?;
+        assert_contains(&code, expected_contents)
+    }
 
     #[test]
     fn test_serialize_module_search_paths() -> Result<()> {
-        let mut config = EmbeddedPythonConfig::default();
-        config.config.module_search_paths =
-            Some(vec![PathBuf::from("$ORIGIN/lib"), PathBuf::from("lib")]);
+        assert_serialize_module_search_paths(
+            &["$ORIGIN/lib", "lib"],
+            "module_search_paths: Some(vec![std::path::PathBuf::from(\"$ORIGIN/lib\"), std::path::PathBuf::from(\"lib\")]),"
+        )
+    }
 
-        let code = config.to_oxidized_python_interpreter_config_rs(None)?;
+    #[test]
+    fn test_serialize_module_search_paths_backslash() -> Result<()> {
+        assert_serialize_module_search_paths(
+            &["$ORIGIN\\lib", "lib"],
+            "module_search_paths: Some(vec![std::path::PathBuf::from(\"$ORIGIN\\\\lib\"), std::path::PathBuf::from(\"lib\")]),"
+        )
+    }
 
-        assert!(code.contains("module_search_paths: Some(vec![std::path::PathBuf::from(\"$ORIGIN/lib\"), std::path::PathBuf::from(\"lib\")]),"));
+    #[test]
+    fn test_serialize_filesystem_fields() -> Result<()> {
+        let mut config = PyembedPythonInterpreterConfig::default();
+        config.config.filesystem_encoding = Some("ascii".to_string());
+        config.config.filesystem_errors = Some("strict".to_string());
+
+        let code = config.to_oxidized_python_interpreter_config_rs()?;
+
+        assert!(code.contains("filesystem_encoding: Some(\"ascii\".to_string()),"));
+        assert!(code.contains("filesystem_errors: Some(\"strict\".to_string()),"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_backslash_in_path() -> Result<()> {
+        let mut config = PyembedPythonInterpreterConfig::default();
+        config.tcl_library = Some(PathBuf::from("c:\\windows"));
+
+        let code = config.to_oxidized_python_interpreter_config_rs()?;
+
+        assert_contains(
+            &code,
+            "tcl_library: Some(std::path::PathBuf::from(\"c:\\\\windows\")),",
+        )
+    }
+
+    // TODO enable once CI has a linkable Python.
+    #[test]
+    #[ignore]
+    fn test_build_all_fields() -> Result<()> {
+        let logger = get_logger()?;
+        let dist = get_default_distribution()?;
+        let policy = dist.create_packaging_policy()?;
+
+        let config = PyembedPythonInterpreterConfig {
+            config: PythonInterpreterConfig {
+                profile: Default::default(),
+                allocator: Some(Allocator::MallocDebug),
+                configure_locale: Some(true),
+                coerce_c_locale: Some(CoerceCLocale::C),
+                coerce_c_locale_warn: Some(true),
+                development_mode: Some(true),
+                isolated: Some(false),
+                legacy_windows_fs_encoding: Some(false),
+                parse_argv: Some(true),
+                use_environment: Some(true),
+                utf8_mode: Some(true),
+                argv: Some(vec!["foo".into(), "bar".into()]),
+                base_exec_prefix: Some("path".into()),
+                base_executable: Some("path".into()),
+                base_prefix: Some("path".into()),
+                buffered_stdio: Some(false),
+                bytes_warning: Some(BytesWarning::Raise),
+                check_hash_pycs_mode: Some(CheckHashPycsMode::Always),
+                configure_c_stdio: Some(true),
+                dump_refs: Some(true),
+                exec_prefix: Some("path".into()),
+                executable: Some("path".into()),
+                fault_handler: Some(false),
+                filesystem_encoding: Some("encoding".into()),
+                filesystem_errors: Some("errors".into()),
+                hash_seed: Some(42),
+                home: Some("home".into()),
+                import_time: Some(true),
+                inspect: Some(false),
+                install_signal_handlers: Some(true),
+                interactive: Some(true),
+                legacy_windows_stdio: Some(false),
+                malloc_stats: Some(false),
+                module_search_paths: Some(vec!["lib".into()]),
+                optimization_level: Some(BytecodeOptimizationLevel::One),
+                parser_debug: Some(true),
+                pathconfig_warnings: Some(false),
+                prefix: Some("prefix".into()),
+                program_name: Some("program_name".into()),
+                pycache_prefix: Some("prefix".into()),
+                python_path_env: Some("env".into()),
+                quiet: Some(true),
+                run_command: Some("command".into()),
+                run_filename: Some("filename".into()),
+                run_module: Some("module".into()),
+                show_ref_count: Some(false),
+                site_import: Some(true),
+                skip_first_source_line: Some(false),
+                stdio_encoding: Some("encoding".into()),
+                stdio_errors: Some("errors".into()),
+                tracemalloc: Some(false),
+                user_site_directory: Some(false),
+                verbose: Some(true),
+                warn_options: Some(vec!["option0".into(), "option1".into()]),
+                write_bytecode: Some(true),
+                x_options: Some(vec!["x0".into(), "x1".into()]),
+            },
+            allocator_backend: MemoryAllocatorBackend::Default,
+            allocator_raw: true,
+            allocator_mem: true,
+            allocator_obj: true,
+            allocator_pymalloc_arena: true,
+            allocator_debug: true,
+            set_missing_path_configuration: false,
+            oxidized_importer: true,
+            filesystem_importer: true,
+            packed_resources: vec![
+                PyembedPackedResourcesSource::MemoryIncludeBytes(PathBuf::from("packed-resources")),
+                PyembedPackedResourcesSource::MemoryMappedPath(PathBuf::from(
+                    "$ORIGIN/packed-resources",
+                )),
+            ],
+            argvb: true,
+            sys_frozen: true,
+            sys_meipass: true,
+            terminfo_resolution: TerminfoResolution::Dynamic,
+            tcl_library: Some("path".into()),
+            write_modules_directory_env: Some("env".into()),
+        };
+
+        let builder = dist.as_python_executable_builder(
+            &logger,
+            env!("HOST"),
+            env!("HOST"),
+            "all_config_fields",
+            BinaryLibpythonLinkMode::Dynamic,
+            &policy,
+            &config,
+            None,
+        )?;
+
+        crate::project_building::build_python_executable(
+            &logger,
+            "all_config_fields",
+            builder.as_ref(),
+            env!("HOST"),
+            "0",
+            false,
+        )?;
 
         Ok(())
     }

@@ -2,14 +2,22 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import collections.abc
 import email.message
+
+# email.parser may be unused. However, it is needed by Rust code and some
+# sys.path mucking in tests may prevent it from being imported. So import
+# here to ensure it is cached in sys.modules so Rust can import it.
+import email.parser
 import importlib.metadata
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
 
 from oxidized_importer import (
+    OxidizedDistribution,
     OxidizedFinder,
     OxidizedResourceCollector,
     find_resources_in_path,
@@ -22,11 +30,15 @@ class TestImporterMetadata(unittest.TestCase):
             prefix="oxidized_importer-test-"
         )
         self.td = pathlib.Path(self.raw_temp_dir.name)
+        self.old_finders = list(sys.meta_path)
+        self.old_path = list(sys.path)
 
     def tearDown(self):
         self.raw_temp_dir.cleanup()
         del self.raw_temp_dir
         del self.td
+        sys.meta_path[:] = self.old_finders
+        sys.path[:] = self.old_path
 
     def _write_metadata(self):
         metadata_path = self.td / "my_package-1.0.dist-info" / "METADATA"
@@ -42,27 +54,62 @@ class TestImporterMetadata(unittest.TestCase):
             collector.add_in_memory(r)
 
         f = OxidizedFinder()
-        f.add_resources(collector.oxidize()[0])
+        f.add_resources(
+            collector.oxidize(python_exe=os.environ.get("PYTHON_SYS_EXECUTABLE"))[0]
+        )
 
         return f
 
     def test_find_distributions_empty(self):
         f = OxidizedFinder()
         dists = f.find_distributions()
-        self.assertIsInstance(dists, list)
+        self.assertIsInstance(dists, collections.abc.Iterator)
+        dists = list(dists)
         self.assertEqual(len(dists), 0)
+
+    def test_find_distributions_default_context(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        dists = f.find_distributions(importlib.metadata.DistributionFinder.Context())
+        self.assertIsInstance(dists, collections.abc.Iterator)
+        dists = list(dists)
+        self.assertEqual(len(dists), 1)
+
+    def test_find_distributions_context_unknown_name(self):
+        f = OxidizedFinder()
+
+        dists = list(
+            f.find_distributions(
+                importlib.metadata.DistributionFinder.Context(name="missing")
+            )
+        )
+        self.assertEqual(len(dists), 0)
+
+    def test_find_distributions_context_name(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        dists = list(
+            f.find_distributions(
+                importlib.metadata.DistributionFinder.Context(name="my_package")
+            )
+        )
+        self.assertEqual(len(dists), 1)
+        dist = dists[0]
+        self.assertIsInstance(dist, OxidizedDistribution)
+        self.assertEqual(dist.version, "1.0")
 
     def test_read_text(self):
         self._write_metadata()
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
-        self.assertIsInstance(dists, list)
+        dists = list(f.find_distributions())
         self.assertEqual(len(dists), 1)
 
         d = dists[0]
 
-        self.assertEqual(d.__class__.__name__, "OxidizedDistribution")
+        self.assertIsInstance(d, OxidizedDistribution)
 
         # read_text() on missing file returns None.
         self.assertIsNone(d.read_text("does_not_exist"))
@@ -74,8 +121,7 @@ class TestImporterMetadata(unittest.TestCase):
         self._write_metadata()
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
-        self.assertIsInstance(dists, list)
+        dists = list(f.find_distributions())
         self.assertEqual(len(dists), 1)
 
         metadata = dists[0].metadata
@@ -97,9 +143,11 @@ class TestImporterMetadata(unittest.TestCase):
             collector.add_in_memory(r)
 
         f = OxidizedFinder()
-        f.add_resources(collector.oxidize()[0])
+        f.add_resources(
+            collector.oxidize(python_exe=os.environ.get("PYTHON_SYS_EXECUTABLE"))[0]
+        )
 
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
         self.assertEqual(len(dists), 1)
 
         metadata = dists[0].metadata
@@ -111,14 +159,14 @@ class TestImporterMetadata(unittest.TestCase):
         self._write_metadata()
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
         self.assertEqual(dists[0].version, "1.0")
 
     def test_missing_entry_points(self):
         self._write_metadata()
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
         self.assertEqual(len(dists), 1)
 
         eps = dists[0].entry_points
@@ -137,7 +185,7 @@ class TestImporterMetadata(unittest.TestCase):
 
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
 
         eps = dists[0].entry_points
 
@@ -155,7 +203,7 @@ class TestImporterMetadata(unittest.TestCase):
         self._write_metadata()
         f = self._finder_from_td()
 
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
 
         self.assertIsNone(dists[0].requires)
 
@@ -167,7 +215,7 @@ class TestImporterMetadata(unittest.TestCase):
             fh.write(b"Requires-Dist: bar; extra == 'all'\n")
 
         f = self._finder_from_td()
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
 
         requires = dists[0].requires
         self.assertIsInstance(requires, list)
@@ -186,13 +234,111 @@ class TestImporterMetadata(unittest.TestCase):
             fh.write("foo\n")
 
         f = self._finder_from_td()
-        dists = f.find_distributions()
+        dists = list(f.find_distributions())
         self.assertEqual(len(dists), 1)
 
         requires = dists[0].requires
         self.assertIsInstance(requires, list)
         self.assertEqual(requires, ["foo"])
 
+    def test_distribution_locate_file(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        dist = list(f.find_distributions())[0]
+
+        with self.assertRaises(AttributeError):
+            dist.locate_file("METADATA")
+
+    def test_distribution_from_name(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        sys.meta_path = [f]
+        sys.path = []
+
+        with self.assertRaises(importlib.metadata.PackageNotFoundError):
+            OxidizedDistribution.from_name("missing")
+
+        dist = OxidizedDistribution.from_name("my_package")
+        self.assertIsInstance(dist, OxidizedDistribution)
+
+        metadata = importlib.metadata.metadata("my_package")
+        self.assertIsInstance(metadata, email.message.Message)
+        self.assertEqual(metadata["Name"], "my_package")
+        self.assertEqual(metadata["Version"], "1.0")
+
+    def test_distribution_discover(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        sys.meta_path = [f]
+        sys.path = []
+
+        dists = OxidizedDistribution.discover()
+        self.assertIsInstance(dists, collections.abc.Iterator)
+        dists = list(dists)
+        self.assertEqual(len(dists), 1)
+
+        dist = dists[0]
+        self.assertEqual(dist.metadata["Name"], "my_package")
+
+    def test_distribution_discover_context_kwarg(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        sys.meta_path = [f]
+        sys.path = []
+
+        dists = list(
+            OxidizedDistribution.discover(
+                context=importlib.metadata.DistributionFinder.Context(name="missing")
+            )
+        )
+        self.assertEqual(len(dists), 0)
+
+        dists = list(
+            OxidizedDistribution.discover(
+                context=importlib.metadata.DistributionFinder.Context()
+            )
+        )
+        self.assertEqual(len(dists), 1)
+
+        dists = list(
+            OxidizedDistribution.discover(
+                context=importlib.metadata.DistributionFinder.Context(name="my_package")
+            )
+        )
+        self.assertEqual(len(dists), 1)
+
+    def test_distribution_discover_name_kwarg(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        sys.meta_path = [f]
+        sys.path = []
+
+        dists = list(OxidizedDistribution.discover(name="missing"))
+        self.assertEqual(len(dists), 0)
+
+        dists = list(OxidizedDistribution.discover(name="my_package"))
+        self.assertEqual(len(dists), 1)
+
+    def test_distribution_discover_conflicting_args(self):
+        with self.assertRaises(ValueError):
+            OxidizedDistribution.discover(context="ignored", name="ignored")
+
+    def test_distribution_at(self):
+        self._write_metadata()
+        f = self._finder_from_td()
+
+        sys.meta_path = [f]
+        sys.path = []
+
+        # Not yet implemented.
+        with self.assertRaises(AttributeError):
+            OxidizedDistribution.at(self.td)
+
 
 if __name__ == "__main__":
-    unittest.main(exit=False)
+    unittest.main()

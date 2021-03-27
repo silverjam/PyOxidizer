@@ -8,13 +8,10 @@ Interaction with Python packaging tools (pip, setuptools, etc).
 
 use {
     super::{
-        binary::LibpythonLinkMode,
-        distribution::{download_distribution, PythonDistribution},
-        distutils::read_built_extensions,
-        standalone_distribution::resolve_python_paths,
+        binary::LibpythonLinkMode, distribution::PythonDistribution,
+        distutils::read_built_extensions, standalone_distribution::resolve_python_paths,
     },
-    crate::python_distributions::GET_PIP_PY_19,
-    anyhow::{anyhow, Context, Result},
+    anyhow::{anyhow, Result},
     duct::cmd,
     python_packaging::{
         filesystem_scanning::find_python_resources, policy::PythonPackagingPolicy,
@@ -25,157 +22,9 @@ use {
         collections::{hash_map::RandomState, HashMap},
         hash::BuildHasher,
         io::{BufRead, BufReader},
-        iter::FromIterator,
         path::{Path, PathBuf},
     },
 };
-
-/// Pip requirements file for bootstrapping packaging tools.
-pub const PIP_BOOTSTRAP_REQUIREMENTS: &str = indoc::indoc!(
-    "wheel==0.34.2 \\
-        --hash=sha256:8788e9155fe14f54164c1b9eb0a319d98ef02c160725587ad60f14ddc57b6f96 \\
-        --hash=sha256:df277cb51e61359aba502208d680f90c0493adec6f0e848af94948778aed386e
-    pip==20.0.2 \\
-        --hash=sha256:4ae14a42d8adba3205ebeb38aa68cfc0b6c346e1ae2e699a0b3bad4da19cef5c \\\
-         --hash=sha256:7db0c8ea4c7ea51c8049640e8e6e7fde949de672bfa4949920675563a5a6967f
-    setuptools==45.1.0 \\
-        --hash=sha256:68e7fd3508687f94367f1aa090a3ed921cd045a60b73d8b0aa1f305199a0ca28 \\
-        --hash=sha256:91f72d83602a6e5e4a9e4fe296e27185854038d7cbda49dcd7006c4d3b3b89d5"
-);
-
-/// Bootstrap Python packaging tools given a Python executable.
-///
-/// Bootstrapping packaging tools in a secure and deterministic manner is
-/// quite difficult in practice! That's because `get-pip.py` doesn't
-/// work deterministically by default. See
-/// https://github.com/pypa/get-pip/issues/60.
-///
-/// Our solution to this is to download `get-pip.py` and then hack its source
-/// code to allow use of a requirements file for installing all dependencies.
-///
-/// We can't just run a vanilla `get-pip.py` with a requirements file because
-/// `get-pip` will internally always run the equivalent of
-/// `pip install --upgrade pip`. You can control the value of `pip` here. But
-/// if you define a `pip` entry in a requirements file (which is necessary to
-/// make the operation secure and deterministic), pip complains because the
-/// `pip` from the command line argument doesn't have a hash!
-///
-/// We also tried to install `setuptools`, `pip`, etc direct from their
-/// source distributions. However we couldn't get this to work either!
-/// Modern versions of setuptools can't self-bootstrap: setuptools depends
-/// on setuptools. The ancient way of bootstrapping setuptools was to use
-/// `ez_setup.py`. But this script (again) doesn't pin content hashes or
-/// versions, and isn't secure nor deterministic. We tried to download
-/// an old version of setuptools that didn't require itself to install. But
-/// we couldn't get this working either, possibly due to incompatibilities
-/// with modern Python versions.
-///
-/// Since modern versions of `get-pip.py` just work in their default
-/// non-deterministic mode, hacking `get-pip.py` to do what we want was
-/// the path of least resistance.
-#[allow(unused)]
-pub fn bootstrap_packaging_tools(
-    logger: &slog::Logger,
-    python_exe: &Path,
-    cache_dir: &Path,
-    bin_dir: &Path,
-    lib_dir: &Path,
-) -> Result<()> {
-    let get_pip_py_path =
-        download_distribution(&GET_PIP_PY_19.url, &GET_PIP_PY_19.sha256, cache_dir)?;
-
-    let temp_dir = tempdir::TempDir::new("pyoxidizer-bootstrap-packaging")?;
-
-    // We need to hack `get-pip.py`'s source code to allow exclusive use of a
-    // requirements file for installing `pip`. The `implicit_*` variables control
-    // the packages installed via command line arguments. We force their value
-    // to false so all packages come from the requirements file.
-    let get_pip_py_data = std::fs::read_to_string(&get_pip_py_path)?;
-    let get_pip_py_data = get_pip_py_data
-        .replace("implicit_pip = True", "implicit_pip = False")
-        .replace("implicit_setuptools = True", "implicit_setuptools = False")
-        .replace("implicit_wheel = True", "implicit_wheel = False");
-
-    let get_pip_py_path = temp_dir.path().join("get-pip.py");
-    std::fs::write(&get_pip_py_path, get_pip_py_data)?;
-
-    let bootstrap_txt_path = temp_dir.path().join("pip-bootstrap.txt");
-    std::fs::write(&bootstrap_txt_path, PIP_BOOTSTRAP_REQUIREMENTS)?;
-
-    // We install to a temp directory then copy files into the target directory.
-    // We do this because we may not want to modify the source Python distribution
-    // and the default install layout may not be appropriate.
-    let install_dir = temp_dir.path().join("pip-installed");
-
-    warn!(logger, "running get-pip.py to bootstrap pip");
-    let command = cmd(
-        python_exe,
-        vec![
-            format!("{}", get_pip_py_path.display()),
-            "--require-hashes".to_string(),
-            "-r".to_string(),
-            format!("{}", bootstrap_txt_path.display()),
-            "--prefix".to_string(),
-            format!("{}", install_dir.display()),
-        ],
-    )
-    .dir(temp_dir.path())
-    .stderr_to_stdout()
-    .reader()?;
-    {
-        let reader = BufReader::new(&command);
-        for line in reader.lines() {
-            warn!(logger, "{}", line?);
-        }
-    }
-
-    let output = command
-        .try_wait()?
-        .ok_or_else(|| anyhow!("unable to wait on command"))?;
-    if !output.status.success() {
-        return Err(anyhow!("error installing pip"));
-    }
-
-    // TODO support non-Windows install layouts.
-    let source_bin_dir = install_dir.join("Scripts");
-    let source_lib_dir = install_dir.join("Lib").join("site-packages");
-
-    for entry in walkdir::WalkDir::new(&source_bin_dir) {
-        let entry = entry?;
-
-        if entry.file_type().is_dir() {
-            continue;
-        }
-
-        let rel = entry.path().strip_prefix(&source_bin_dir)?;
-
-        let dest_path = bin_dir.join(rel);
-        let parent_dir = dest_path
-            .parent()
-            .ok_or_else(|| anyhow!("unable to determine parent directory"))?;
-        std::fs::create_dir_all(parent_dir)?;
-        std::fs::copy(entry.path(), &dest_path).context("copying bin file")?;
-    }
-
-    for entry in walkdir::WalkDir::new(&source_lib_dir) {
-        let entry = entry?;
-
-        if entry.file_type().is_dir() {
-            continue;
-        }
-
-        let rel = entry.path().strip_prefix(&source_lib_dir)?;
-
-        let dest_path = lib_dir.join(rel);
-        let parent_dir = dest_path
-            .parent()
-            .ok_or_else(|| anyhow!("unable to determine parent directory"))?;
-        std::fs::create_dir_all(parent_dir)?;
-        std::fs::copy(entry.path(), &dest_path).context("copying lib file")?;
-    }
-
-    Ok(())
-}
 
 /// Find resources installed as part of a packaging operation.
 pub fn find_resources<'a>(
@@ -187,11 +36,10 @@ pub fn find_resources<'a>(
     let mut res = Vec::new();
 
     let built_extensions = if let Some(p) = state_dir {
-        HashMap::from_iter(
-            read_built_extensions(&p)?
-                .iter()
-                .map(|ext| (ext.name.clone(), ext.clone())),
-        )
+        read_built_extensions(&p)?
+            .iter()
+            .map(|ext| (ext.name.clone(), ext.clone()))
+            .collect()
     } else {
         HashMap::new()
     };
@@ -242,7 +90,9 @@ pub fn pip_download<'a>(
     verbose: bool,
     args: &[String],
 ) -> Result<Vec<PythonResource<'a>>> {
-    let temp_dir = tempdir::TempDir::new("pyoxidizer-pip-download")?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pyoxidizer-pip-download")
+        .tempdir()?;
 
     host_dist.ensure_pip(logger)?;
 
@@ -341,11 +191,13 @@ pub fn pip_install<'a, S: BuildHasher>(
     install_args: &[String],
     extra_envs: &HashMap<String, String, S>,
 ) -> Result<Vec<PythonResource<'a>>> {
-    let temp_dir = tempdir::TempDir::new("pyoxidizer-pip-install")?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pyoxidizer-pip-install")
+        .tempdir()?;
 
     dist.ensure_pip(logger)?;
 
-    let mut env: HashMap<String, String, RandomState> = HashMap::from_iter(std::env::vars());
+    let mut env: HashMap<String, String, RandomState> = std::env::vars().collect();
     for (k, v) in dist.resolve_distutils(logger, libpython_link_mode, temp_dir.path(), &[])? {
         env.insert(k, v);
     }
@@ -414,6 +266,7 @@ pub fn read_virtualenv<'a>(
 }
 
 /// Run `setup.py install` against a path and return found resources.
+#[allow(clippy::too_many_arguments)]
 pub fn setup_py_install<'a, S: BuildHasher>(
     logger: &slog::Logger,
     dist: &dyn PythonDistribution,
@@ -431,7 +284,9 @@ pub fn setup_py_install<'a, S: BuildHasher>(
         ));
     }
 
-    let temp_dir = tempdir::TempDir::new("pyoxidizer-setup-py-install")?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pyoxidizer-setup-py-install")
+        .tempdir()?;
 
     let target_dir_path = temp_dir.path().join("install");
     let target_dir_s = target_dir_path.display().to_string();
@@ -440,7 +295,7 @@ pub fn setup_py_install<'a, S: BuildHasher>(
 
     std::fs::create_dir_all(&python_paths.site_packages)?;
 
-    let mut envs: HashMap<String, String, RandomState> = HashMap::from_iter(std::env::vars());
+    let mut envs: HashMap<String, String, RandomState> = std::env::vars().collect();
     for (k, v) in dist.resolve_distutils(
         &logger,
         libpython_link_mode,
@@ -509,7 +364,7 @@ mod tests {
     use {
         super::*,
         crate::testutil::*,
-        std::{collections::BTreeSet, iter::FromIterator, ops::Deref},
+        std::{collections::BTreeSet, ops::Deref},
     };
 
     #[test]
@@ -576,11 +431,6 @@ mod tests {
                 continue;
             }
 
-            // TODO enable once Python 3.9 wheel is published.
-            if target_dist.python_major_minor_version() == "3.9" {
-                continue;
-            }
-
             warn!(
                 logger,
                 "using distribution {}-{}-{}",
@@ -597,34 +447,53 @@ mod tests {
                 &*target_dist,
                 &policy,
                 false,
-                &["zstandard==0.14.0".to_string()],
+                &["zstandard==0.15.2".to_string()],
             )?;
 
             assert!(!resources.is_empty());
             let zstandard_resources = resources
                 .iter()
-                .filter(|r| r.is_in_packages(&["zstandard".to_string(), "zstd".to_string()]))
+                .filter(|r| r.is_in_packages(&["zstandard".to_string()]))
                 .collect::<Vec<_>>();
             assert!(!zstandard_resources.is_empty());
 
-            let full_names = BTreeSet::from_iter(zstandard_resources.iter().map(|r| r.full_name()));
+            let full_names = zstandard_resources
+                .iter()
+                .map(|r| r.full_name())
+                .collect::<BTreeSet<_>>();
+
+            let mut expected_names = [
+                "zstandard",
+                "zstandard.__init__.pyi",
+                "zstandard.backend_c",
+                "zstandard.backend_cffi",
+                "zstandard.py.typed",
+                "zstandard:LICENSE",
+                "zstandard:METADATA",
+                "zstandard:RECORD",
+                "zstandard:WHEEL",
+                "zstandard:top_level.txt",
+            ]
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<BTreeSet<String>>();
+
+            let mut expected_extensions_count = 1;
+            let mut expected_first_extension_name = "zstandard.backend_c";
+
+            if matches!(
+                target_dist.target_triple.as_str(),
+                "i686-pc-windows-msvc" | "x86_64-pc-windows-msvc"
+            ) {
+                expected_names.insert("zstandard._cffi".to_string());
+                expected_extensions_count = 2;
+                expected_first_extension_name = "zstandard._cffi";
+            }
 
             assert_eq!(
-                full_names,
-                BTreeSet::from_iter(
-                    [
-                        "zstd",
-                        "zstandard",
-                        "zstandard.cffi",
-                        "zstandard:LICENSE",
-                        "zstandard:top_level.txt",
-                        "zstandard:WHEEL",
-                        "zstandard:RECORD",
-                        "zstandard:METADATA",
-                    ]
-                    .iter()
-                    .map(|x| x.to_string())
-                )
+                full_names, expected_names,
+                "target triple: {}",
+                target_dist.target_triple
             );
 
             let extensions = zstandard_resources
@@ -635,9 +504,14 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            assert_eq!(extensions.len(), 1);
+            assert_eq!(
+                extensions.len(),
+                expected_extensions_count,
+                "target triple: {}",
+                target_dist.target_triple
+            );
             let em = extensions[0];
-            assert_eq!(em.name, "zstd");
+            assert_eq!(em.name, expected_first_extension_name);
             assert!(em.shared_library.is_some());
         }
 
@@ -655,11 +529,6 @@ mod tests {
                 continue;
             }
 
-            // TODO support once a Python 3.9 wheel is published.
-            if target_dist.python_major_minor_version() == "3.9" {
-                continue;
-            }
-
             warn!(
                 logger,
                 "using distribution {}-{}-{}",
@@ -672,14 +541,22 @@ mod tests {
             policy.set_file_scanner_emit_files(true);
             policy.set_file_scanner_classify_files(true);
 
-            let resources = pip_download(
+            let res = pip_download(
                 &logger,
                 &*host_dist,
                 &*target_dist,
                 &policy,
                 false,
-                &["numpy==1.19.2".to_string()],
-            )?;
+                &["numpy==1.20.1".to_string()],
+            );
+
+            // numpy doesn't yet publish a macOS ARM wheel.
+            if target_dist.target_triple == "aarch64-apple-darwin" {
+                assert!(res.is_err());
+                continue;
+            }
+
+            let resources = res?;
 
             assert!(!resources.is_empty());
 

@@ -27,11 +27,7 @@ is implemented in C. Rust is simply a tool to achieve an end goal, albeit
 a rather effective and powerful tool.
 */
 
-mod analyze;
-#[allow(unused)]
-pub mod app_packaging;
 mod cli;
-//mod distribution;
 mod environment;
 mod logging;
 mod project_building;

@@ -9,20 +9,30 @@ not a Python `module`.
 */
 
 use {
-    super::python_resources::PythonResourcesState,
-    lazy_static::lazy_static,
+    crate::python_resources::PythonResourcesState,
     memory_module_sys::{
         MemoryFreeLibrary, MemoryGetProcAddress, MemoryLoadLibraryEx, HCUSTOMMODULE,
     },
-    std::collections::HashMap,
-    std::ffi::{c_void, CStr},
-    std::sync::atomic::{AtomicUsize, Ordering},
-    std::sync::Mutex,
-    winapi::shared::basetsd::SIZE_T,
-    winapi::shared::minwindef::{BOOL, DWORD, FARPROC, HINSTANCE__, LPVOID},
-    winapi::shared::ntdef::LPCSTR,
-    winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA},
-    winapi::um::memoryapi::{VirtualAlloc, VirtualFree},
+    once_cell::sync::Lazy,
+    std::{
+        collections::HashMap,
+        ffi::{c_void, CStr},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    },
+    winapi::{
+        shared::{
+            basetsd::SIZE_T,
+            minwindef::{BOOL, DWORD, FARPROC, HINSTANCE__, LPVOID},
+            ntdef::LPCSTR,
+        },
+        um::{
+            libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA},
+            memoryapi::{VirtualAlloc, VirtualFree},
+        },
+    },
 };
 
 /// Holds state for a module loaded from memory.
@@ -57,14 +67,12 @@ struct MemoryModules {
 
 unsafe impl Send for MemoryModules {}
 
-lazy_static! {
-    static ref MEMORY_MODULES: Mutex<MemoryModules> = {
-        Mutex::new(MemoryModules {
-            modules: HashMap::new(),
-            module_ptrs: Vec::new(),
-        })
-    };
-}
+static MEMORY_MODULES: Lazy<Mutex<MemoryModules>> = Lazy::new(|| {
+    Mutex::new(MemoryModules {
+        modules: HashMap::new(),
+        module_ptrs: Vec::new(),
+    })
+});
 
 /// Load a library from memory, possibly retrieving missing libraries from resources state.
 ///
@@ -217,11 +225,11 @@ extern "C" fn custom_free_library(module: HCUSTOMMODULE, _user_data: *mut c_void
         let mut free_module = None;
 
         for (name, module_state) in &memory_state.modules {
-            if module_state.ptr == module {
-                if module_state.ref_count.fetch_sub(1, Ordering::Acquire) == 1 {
-                    free_module = Some(name.to_string());
-                    break;
-                }
+            if module_state.ptr == module
+                && module_state.ref_count.fetch_sub(1, Ordering::Acquire) == 1
+            {
+                free_module = Some(name.to_string());
+                break;
             }
         }
 

@@ -7,25 +7,32 @@ Management of Python resources.
 */
 
 use {
-    super::conversion::{
-        path_to_pathlib_path, path_to_pyobject, pyobject_optional_resources_map_to_owned_bytes,
-        pyobject_optional_resources_map_to_pathbuf, pyobject_to_owned_bytes_optional,
-        pyobject_to_pathbuf_optional,
+    crate::{
+        config::{PackedResourcesSource, ResolvedOxidizedPythonInterpreterConfig},
+        conversion::{
+            path_to_pathlib_path, path_to_pyobject, pyobject_optional_resources_map_to_owned_bytes,
+            pyobject_optional_resources_map_to_pathbuf, pyobject_to_owned_bytes_optional,
+            pyobject_to_pathbuf_optional,
+        },
+        error::NewInterpreterError,
     },
     anyhow::Result,
-    cpython::exc::{ImportError, OSError, TypeError},
     cpython::{
+        buffer::PyBuffer,
+        exc::{ImportError, OSError, TypeError, ValueError},
         py_class, NoArgs, ObjectProtocol, PyBytes, PyDict, PyErr, PyList, PyModule, PyObject,
         PyResult, PyString, PyTuple, Python, PythonObject, ToPyObject,
     },
     python3_sys as pyffi,
     python_packed_resources::data::Resource,
-    std::borrow::Cow,
-    std::cell::RefCell,
-    std::collections::HashMap,
-    std::ffi::CStr,
-    std::iter::FromIterator,
-    std::path::{Path, PathBuf},
+    std::{
+        borrow::Cow,
+        cell::RefCell,
+        collections::{hash_map::Entry, HashMap},
+        convert::TryFrom,
+        ffi::CStr,
+        path::{Path, PathBuf},
+    },
 };
 
 /// Python bytecode optimization level.
@@ -371,6 +378,15 @@ where
 
     /// Named resources available for loading.
     pub resources: HashMap<Cow<'a, str>, Resource<'a, X>>,
+
+    /// List of `PyObject` that back indexed data.
+    ///
+    /// Holding a reference to these prevents them from being gc'd and for
+    /// memory referenced by `self.resources` from being freed.
+    backing_py_objects: Vec<PyObject>,
+
+    /// Holds memory mapped file instances that resources data came from.
+    backing_mmaps: Vec<Box<memmap::Mmap>>,
 }
 
 impl<'a> Default for PythonResourcesState<'a, u8> {
@@ -379,7 +395,46 @@ impl<'a> Default for PythonResourcesState<'a, u8> {
             current_exe: PathBuf::new(),
             origin: PathBuf::new(),
             resources: HashMap::new(),
+            backing_py_objects: vec![],
+            backing_mmaps: vec![],
         }
+    }
+}
+
+impl<'a, 'config: 'a> TryFrom<&ResolvedOxidizedPythonInterpreterConfig<'config>>
+    for PythonResourcesState<'a, u8>
+{
+    type Error = NewInterpreterError;
+
+    fn try_from(
+        config: &ResolvedOxidizedPythonInterpreterConfig<'config>,
+    ) -> Result<Self, Self::Error> {
+        let mut state = Self {
+            current_exe: config.exe().clone(),
+            origin: config.origin().clone(),
+            ..Default::default()
+        };
+
+        for source in &config.packed_resources {
+            match source {
+                PackedResourcesSource::Memory(data) => {
+                    state
+                        .index_data(data)
+                        .map_err(NewInterpreterError::Simple)?;
+                }
+                PackedResourcesSource::MemoryMappedPath(path) => {
+                    state
+                        .index_path_memory_mapped(path)
+                        .map_err(NewInterpreterError::Dynamic)?;
+                }
+            }
+        }
+
+        state
+            .index_interpreter_builtins()
+            .map_err(NewInterpreterError::Simple)?;
+
+        Ok(state)
     }
 }
 
@@ -389,25 +444,149 @@ impl<'a> PythonResourcesState<'a, u8> {
         let exe = std::env::current_exe().map_err(|_| "unable to obtain current executable")?;
         let origin = exe
             .parent()
-            .ok_or_else(|| "unable to get executable parent")?
+            .ok_or("unable to get executable parent")?
             .to_path_buf();
 
         Ok(Self {
             current_exe: exe,
             origin,
-            resources: Default::default(),
+            ..Default::default()
         })
     }
 
-    /// Load state from the environment and by parsing data structures.
-    pub fn load(&mut self, resource_datas: &[&'a [u8]]) -> Result<(), &'static str> {
-        // Loading of builtin and frozen knows to mutate existing entries rather
-        // than replace. So do these last.
-        for data in resource_datas {
-            self.load_resources(data)?;
+    /// Load resources by parsing a blob.
+    ///
+    /// If an existing entry exists, the new entry will be merged into it. Set fields
+    /// on the incoming entry will overwrite fields on the existing entry.
+    ///
+    /// If an entry doesn't exist, the resource will be inserted as-is.
+    pub fn index_data(&mut self, data: &'a [u8]) -> Result<(), &'static str> {
+        let resources = python_packed_resources::parser::load_resources(data)?;
+
+        // Reserve space for expected number of incoming items so we can avoid extra
+        // allocations.
+        self.resources.reserve(resources.expected_resources_count());
+
+        for resource in resources {
+            let resource = resource?;
+
+            match self.resources.entry(resource.name.clone()) {
+                Entry::Occupied(existing) => {
+                    existing.into_mut().merge_from(resource)?;
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(resource);
+                }
+            }
         }
-        self.load_interpreter_builtin_modules()?;
-        self.load_interpreter_frozen_modules()?;
+
+        Ok(())
+    }
+
+    /// Load resources data from a filesystem path using memory mapped I/O.
+    pub fn index_path_memory_mapped(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+
+        let mapped = Box::new(unsafe { memmap::Mmap::map(&f) }.map_err(|e| e.to_string())?);
+
+        let data = unsafe { std::slice::from_raw_parts::<u8>(mapped.as_ptr(), mapped.len()) };
+
+        self.index_data(data)?;
+        self.backing_mmaps.push(mapped);
+
+        Ok(())
+    }
+
+    /// Load resources from packed data stored in a PyObject.
+    ///
+    /// The `PyObject` must conform to the buffer protocol.
+    pub fn index_pyobject(&mut self, py: Python, obj: PyObject) -> PyResult<()> {
+        let buffer = PyBuffer::get(py, &obj)?;
+
+        let data = unsafe {
+            std::slice::from_raw_parts::<u8>(buffer.buf_ptr() as *const _, buffer.len_bytes())
+        };
+
+        self.index_data(data)
+            .map_err(|msg| PyErr::new::<ValueError, _>(py, msg))?;
+        self.backing_py_objects.push(obj);
+
+        Ok(())
+    }
+
+    /// Load `builtin` modules from the Python interpreter.
+    pub fn index_interpreter_builtin_extension_modules(&mut self) -> Result<(), &'static str> {
+        for i in 0.. {
+            let record = unsafe { pyffi::PyImport_Inittab.offset(i) };
+
+            if unsafe { *record }.name.is_null() {
+                break;
+            }
+
+            let name = unsafe { CStr::from_ptr((*record).name as _) };
+            let name_str = match name.to_str() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err("unable to parse PyImport_Inittab");
+                }
+            };
+
+            self.resources
+                .entry(name_str.into())
+                .and_modify(|r| {
+                    r.is_builtin_extension_module = true;
+                })
+                .or_insert_with(|| Resource {
+                    is_builtin_extension_module: true,
+                    name: Cow::Owned(name_str.to_string()),
+                    ..Resource::default()
+                });
+        }
+
+        Ok(())
+    }
+
+    /// Load `frozen` modules from the Python interpreter.
+    pub fn index_interpreter_frozen_modules(&mut self) -> Result<(), &'static str> {
+        for i in 0.. {
+            let record = unsafe { pyffi::PyImport_FrozenModules.offset(i) };
+
+            if unsafe { *record }.name.is_null() {
+                break;
+            }
+
+            let name = unsafe { CStr::from_ptr((*record).name as _) };
+            let name_str = match name.to_str() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err("unable to parse PyImport_FrozenModules");
+                }
+            };
+
+            self.resources
+                .entry(name_str.into())
+                .and_modify(|r| {
+                    r.is_frozen_module = true;
+                })
+                .or_insert_with(|| Resource {
+                    is_frozen_module: true,
+                    name: Cow::Owned(name_str.to_string()),
+                    ..Resource::default()
+                });
+        }
+
+        Ok(())
+    }
+
+    /// Load resources that are built-in to the Python interpreter.
+    ///
+    /// If this instance's resources are being used by the sole Python importer,
+    /// this needs to be called to ensure modules required during interpreter
+    /// initialization are indexed and loadable by our importer.
+    pub fn index_interpreter_builtins(&mut self) -> Result<(), &'static str> {
+        self.index_interpreter_builtin_extension_modules()?;
+        self.index_interpreter_frozen_modules()?;
 
         Ok(())
     }
@@ -431,6 +610,31 @@ impl<'a> PythonResourcesState<'a, u8> {
         name: &str,
         optimize_level: OptimizeLevel,
     ) -> Option<ImportablePythonModule<u8>> {
+        // Python's filesystem based importer accepts `foo.__init__` as a valid
+        // module name. When these names are encountered, it fails to recognize
+        // that `__init__` is special and happily searches for and uses/imports a
+        // file with `__init__` in it, resulting in a new module object and
+        // `sys.modules` entry (as opposed to silently normalizing to and reusing
+        // `foo`. See https://github.com/indygreg/PyOxidizer/issues/317
+        // and https://bugs.python.org/issue42564 for more.
+        //
+        // Our strategy is to strip off trailing `.__init__` from the requested
+        // module name, effectively aliasing the resource entry for `foo.__init__`
+        // to `foo`. The aliasing of the resource name is pretty uncontroversial.
+        // However, the name stored inside the resource is the actual indexed name,
+        // not the requested name (which may have `.__init__`). If the caller uses
+        // the indexed name instead of the requested name, behavior will diverge from
+        // Python, as an extra `foo.__init__` module object will not be created
+        // and used.
+        //
+        // At the time this comment was written, find_spec() used the resource's
+        // internal name, not the requested name, thus silently treating
+        // `foo.__init__` as `foo`. This behavior is incompatible with CPython's path
+        // importer. But we think it makes more sense, as `__init__` is a filename
+        // encoding and the importer shouldn't even allow it. We only provide support
+        // for recognizing `__init__` because Python code in the wild relies on it.
+        let name = name.strip_suffix(".__init__").unwrap_or(name);
+
         let resource = match self.resources.get(name) {
             Some(entry) => entry,
             None => return None,
@@ -776,95 +980,6 @@ impl<'a> PythonResourcesState<'a, u8> {
         Ok(res.into_object())
     }
 
-    /// Load `builtin` modules from the Python interpreter.
-    fn load_interpreter_builtin_modules(&mut self) -> Result<(), &'static str> {
-        for i in 0.. {
-            let record = unsafe { pyffi::PyImport_Inittab.offset(i) };
-
-            if unsafe { *record }.name.is_null() {
-                break;
-            }
-
-            let name = unsafe { CStr::from_ptr((*record).name as _) };
-            let name_str = match name.to_str() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err("unable to parse PyImport_Inittab");
-                }
-            };
-
-            // Module can be defined by embedded resources data. If exists, just
-            // update the big.
-            if let Some(mut entry) = self.resources.get_mut(name_str) {
-                entry.is_builtin_extension_module = true;
-            } else {
-                self.resources.insert(
-                    Cow::Owned(name_str.to_string()),
-                    Resource {
-                        is_builtin_extension_module: true,
-                        name: Cow::Owned(name_str.to_string()),
-                        ..Resource::default()
-                    },
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Load `frozen` modules from the Python interpreter.
-    fn load_interpreter_frozen_modules(&mut self) -> Result<(), &'static str> {
-        for i in 0.. {
-            let record = unsafe { pyffi::PyImport_FrozenModules.offset(i) };
-
-            if unsafe { *record }.name.is_null() {
-                break;
-            }
-
-            let name = unsafe { CStr::from_ptr((*record).name as _) };
-            let name_str = match name.to_str() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err("unable to parse PyImport_FrozenModules");
-                }
-            };
-
-            // Module can be defined by embedded resources data. If exists, just
-            // update the big.
-            if let Some(mut entry) = self.resources.get_mut(name_str) {
-                entry.is_frozen_module = true;
-            } else {
-                self.resources.insert(
-                    Cow::Owned(name_str.to_string()),
-                    Resource {
-                        is_frozen_module: true,
-                        name: Cow::Owned(name_str.to_string()),
-                        ..Resource::default()
-                    },
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Load resources by parsing a blob.
-    fn load_resources(&mut self, data: &'a [u8]) -> Result<(), &'static str> {
-        let resources = python_packed_resources::parser::load_resources(data)?;
-
-        // Reserve space for expected number of incoming items so we can avoid extra
-        // allocations.
-        self.resources.reserve(resources.expected_resources_count());
-
-        for resource in resources {
-            let resource = resource?;
-
-            self.resources.insert(resource.name.clone(), resource);
-        }
-
-        Ok(())
-    }
-
     /// Serialize resources contained in this data structure.
     ///
     /// `ignore_built` and `ignore_frozen` specify whether to ignore built-in
@@ -879,13 +994,8 @@ impl<'a> PythonResourcesState<'a, u8> {
             .values()
             .filter(|resource| {
                 // This assumes builtins and frozen are mutually exclusive with other types.
-                if resource.is_builtin_extension_module && ignore_builtin {
-                    false
-                } else if resource.is_frozen_module && ignore_frozen {
-                    false
-                } else {
-                    true
-                }
+                !((resource.is_builtin_extension_module && ignore_builtin)
+                    || (resource.is_frozen_module && ignore_frozen))
             })
             .collect::<Vec<&Resource<u8>>>();
 
@@ -1095,7 +1205,7 @@ py_class!(pub class OxidizedResource |py| {
 
     @property def in_memory_package_resources(&self) -> PyResult<Option<HashMap<String, PyBytes>>> {
         Ok(self.resource(py).borrow().in_memory_package_resources.as_ref().map(|x| {
-            HashMap::from_iter(x.iter().map(|(k, v)| (k.to_string(), PyBytes::new(py, v))))
+            x.iter().map(|(k, v)| (k.to_string(), PyBytes::new(py, v))).collect()
         }))
     }
 
@@ -1103,9 +1213,7 @@ py_class!(pub class OxidizedResource |py| {
         if let Some(value) = value {
             self.resource(py).borrow_mut().in_memory_package_resources =
                 pyobject_optional_resources_map_to_owned_bytes(py, &value)?
-                    .map(|x| HashMap::from_iter(
-                        x.iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned())))
-                     ));
+                    .map(|x| x.into_iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned()))).collect());
 
             Ok(())
         } else {
@@ -1115,7 +1223,7 @@ py_class!(pub class OxidizedResource |py| {
 
     @property def in_memory_distribution_resources(&self) -> PyResult<Option<HashMap<String, PyBytes>>> {
         Ok(self.resource(py).borrow().in_memory_distribution_resources.as_ref().map(|x| {
-            HashMap::from_iter(x.iter().map(|(k, v)| (k.to_string(), PyBytes::new(py, v))))
+            x.iter().map(|(k, v)| (k.to_string(), PyBytes::new(py, v))).collect()
         }))
     }
 
@@ -1123,9 +1231,9 @@ py_class!(pub class OxidizedResource |py| {
         if let Some(value) = value {
             self.resource(py).borrow_mut().in_memory_distribution_resources =
                 pyobject_optional_resources_map_to_owned_bytes(py, &value)?
-                    .map(|x| HashMap::from_iter(
-                        x.iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned())))
-                     ));
+                    .map(|x|
+                        x.into_iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned()))).collect()
+                    );
 
             Ok(())
         } else {
@@ -1150,14 +1258,14 @@ py_class!(pub class OxidizedResource |py| {
 
     @property def shared_library_dependency_names(&self) -> PyResult<Option<Vec<String>>> {
         Ok(self.resource(py).borrow().shared_library_dependency_names.as_ref().map(|x| {
-            Vec::from_iter(x.iter().map(|v| v.to_string()))
+            x.into_iter().map(|v| v.to_string()).collect()
         }))
     }
 
     @shared_library_dependency_names.setter def set_shared_library_dependency_names(&self, value: Option<Option<Vec<String>>>) -> PyResult<()> {
         if let Some(value) = value {
             self.resource(py).borrow_mut().shared_library_dependency_names =
-                value.map(|x| Vec::from_iter(x.iter().map(|v| Cow::Owned(v.to_owned()))));
+                value.map(|x| x.into_iter().map(|v| Cow::Owned(v.to_owned())).collect());
 
             Ok(())
         } else {
@@ -1279,9 +1387,9 @@ py_class!(pub class OxidizedResource |py| {
         if let Some(value) = value {
             self.resource(py).borrow_mut().relative_path_package_resources =
                 pyobject_optional_resources_map_to_pathbuf(py, &value)?
-                    .map(|x| HashMap::from_iter(
-                        x.iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned())))
-                     ));
+                    .map(|x|
+                        x.into_iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned()))).collect()
+                    );
 
             Ok(())
         } else {
@@ -1308,9 +1416,9 @@ py_class!(pub class OxidizedResource |py| {
         if let Some(value) = value {
             self.resource(py).borrow_mut().relative_path_distribution_resources =
                 pyobject_optional_resources_map_to_pathbuf(py, &value)?
-                    .map(|x| HashMap::from_iter(
-                        x.iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned())))
-                     ));
+                    .map(|x|
+                        x.into_iter().map(|(k, v)| (Cow::Owned(k.to_owned()), Cow::Owned(v.to_owned()))).collect()
+                    );
 
             Ok(())
         } else {
@@ -1330,4 +1438,99 @@ pub fn resource_to_pyobject(py: Python, resource: &Resource<u8>) -> PyResult<PyO
 #[inline]
 pub fn pyobject_to_resource(py: Python, resource: OxidizedResource) -> Resource<u8> {
     resource.resource(py).borrow().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::OxidizedPythonInterpreterConfig, anyhow::anyhow};
+
+    #[test]
+    fn multiple_resource_blobs() -> Result<()> {
+        let mut state0 = PythonResourcesState::default();
+        state0
+            .add_resource(Resource {
+                name: "foo".into(),
+                is_module: true,
+                in_memory_source: Some(vec![42].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let data0 = state0.serialize_resources(true, true)?;
+
+        let mut state1 = PythonResourcesState::default();
+        state1
+            .add_resource(Resource {
+                name: "bar".into(),
+                is_module: true,
+                in_memory_source: Some(vec![42, 42].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let data1 = state1.serialize_resources(true, true)?;
+
+        let config = OxidizedPythonInterpreterConfig::default().resolve()?;
+
+        let mut resources = PythonResourcesState::try_from(&config)?;
+        resources.index_data(&data0).unwrap();
+        resources.index_data(&data1).unwrap();
+
+        assert!(resources.resources.contains_key("foo".into()));
+        assert!(resources.resources.contains_key("bar".into()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_mapped_file_resources() -> Result<()> {
+        let current_dir = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow!("unable to find current exe parent"))?
+            .to_path_buf();
+
+        let mut state0 = PythonResourcesState::default();
+        state0
+            .add_resource(Resource {
+                name: "foo".into(),
+                is_module: true,
+                in_memory_source: Some(vec![42].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let data0 = state0.serialize_resources(true, true)?;
+
+        let resources_dir = current_dir.join("resources");
+        if !resources_dir.exists() {
+            std::fs::create_dir(&resources_dir)?;
+        }
+
+        let resources_path = resources_dir.join("test_memory_mapped_file_resources");
+        std::fs::write(&resources_path, &data0)?;
+
+        // Absolute path should work.
+        let mut config = OxidizedPythonInterpreterConfig::default();
+        config
+            .packed_resources
+            .push(PackedResourcesSource::MemoryMappedPath(
+                resources_path.clone(),
+            ));
+
+        let resolved = config.clone().resolve()?;
+        let resources = PythonResourcesState::try_from(&resolved)?;
+
+        assert!(resources.resources.contains_key("foo".into()));
+
+        // Now let's try with relative paths.
+        let relative_path =
+            pathdiff::diff_paths(&resources_path, std::env::current_dir()?).unwrap();
+        config.packed_resources.clear();
+        config
+            .packed_resources
+            .push(PackedResourcesSource::MemoryMappedPath(relative_path));
+
+        let resolved = config.resolve()?;
+        let resources = PythonResourcesState::try_from(&resolved)?;
+        assert!(resources.resources.contains_key("foo".into()));
+
+        Ok(())
+    }
 }

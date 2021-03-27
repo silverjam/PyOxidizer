@@ -11,9 +11,6 @@ distribution and embedding it in a larger binary, oftentimes an executable.
 This library exposes that functionality to other tools.
 */
 
-pub mod analyze;
-pub mod app_packaging;
-//pub mod distribution;
 pub mod environment;
 pub mod logging;
 pub mod project_building;

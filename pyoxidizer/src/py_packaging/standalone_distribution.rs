@@ -7,9 +7,9 @@
 use {
     super::{
         binary::{LibpythonLinkMode, PythonBinaryBuilder},
-        config::{default_raw_allocator, EmbeddedPythonConfig},
+        config::{default_memory_allocator, PyembedPythonInterpreterConfig},
         distribution::{
-            resolve_python_distribution_from_location, BinaryLibpythonLinkMode,
+            resolve_python_distribution_from_location, AppleSdkInfo, BinaryLibpythonLinkMode,
             DistributionExtractLock, PythonDistribution, PythonDistributionLocation,
         },
         distutils::prepare_hacked_distutils,
@@ -17,33 +17,31 @@ use {
     },
     crate::environment::{LINUX_TARGET_TRIPLES, MACOS_TARGET_TRIPLES},
     anyhow::{anyhow, Context, Result},
-    copy_dir::copy_dir,
     duct::cmd,
-    lazy_static::lazy_static,
+    once_cell::sync::Lazy,
     path_dedot::ParseDot,
     python_packaging::{
         bytecode::{BytecodeCompiler, PythonBytecodeCompiler},
         filesystem_scanning::{find_python_resources, walk_tree_files},
-        interpreter::{
-            PythonInterpreterConfig, PythonInterpreterProfile, PythonRunMode, TerminfoResolution,
-        },
+        interpreter::{PythonInterpreterConfig, PythonInterpreterProfile, TerminfoResolution},
         location::ConcreteResourceLocation,
         module_util::{is_package_from_path, PythonModuleSuffixes},
         policy::PythonPackagingPolicy,
         resource::{
-            DataLocation, LibraryDependency, PythonExtensionModule, PythonExtensionModuleVariants,
+            LibraryDependency, PythonExtensionModule, PythonExtensionModuleVariants,
             PythonModuleSource, PythonPackageResource, PythonResource,
         },
     },
-    serde::{Deserialize, Serialize},
+    serde::Deserialize,
     slog::{info, warn},
     std::{
         collections::{hash_map::RandomState, BTreeMap, HashMap},
         io::{BufRead, BufReader, Read},
-        iter::FromIterator,
         path::{Path, PathBuf},
         sync::Arc,
     },
+    tugger_file_manifest::FileData,
+    tugger_licensing::{ComponentFlavor, LicensedComponent},
 };
 
 // This needs to be kept in sync with *compiler.py
@@ -61,27 +59,29 @@ const PIP_EXE_BASENAME: &str = "pip3.exe";
 #[cfg(unix)]
 const PIP_EXE_BASENAME: &str = "pip3";
 
-lazy_static! {
-    /// Distribution extensions with known problems on Linux.
-    ///
-    /// These will never be packaged.
-    pub static ref BROKEN_EXTENSIONS_LINUX: Vec<String> = vec![
+/// Distribution extensions with known problems on Linux.
+///
+/// These will never be packaged.
+pub static BROKEN_EXTENSIONS_LINUX: Lazy<Vec<String>> = Lazy::new(|| {
+    vec![
         // Linking issues.
         "_crypt".to_string(),
         // Linking issues.
         "nis".to_string(),
-    ];
+    ]
+});
 
-    /// Distribution extensions with known problems on macOS.
-    ///
-    /// These will never be packaged.
-    pub static ref BROKEN_EXTENSIONS_MACOS: Vec<String> = vec![
+/// Distribution extensions with known problems on macOS.
+///
+/// These will never be packaged.
+pub static BROKEN_EXTENSIONS_MACOS: Lazy<Vec<String>> = Lazy::new(|| {
+    vec![
         // curses and readline have linking issues.
         "curses".to_string(),
         "_curses_panel".to_string(),
         "readline".to_string(),
-    ];
-}
+    ]
+});
 
 #[derive(Debug, Deserialize)]
 struct LinkEntry {
@@ -100,7 +100,7 @@ impl LinkEntry {
             static_library: self
                 .path_static
                 .clone()
-                .map(|p| DataLocation::Path(python_path.join(p))),
+                .map(|p| FileData::Path(python_path.join(p))),
             static_filename: self
                 .path_static
                 .as_ref()
@@ -108,7 +108,7 @@ impl LinkEntry {
             dynamic_library: self
                 .path_dynamic
                 .clone()
-                .map(|p| DataLocation::Path(python_path.join(p))),
+                .map(|p| FileData::Path(python_path.join(p))),
             dynamic_filename: self
                 .path_dynamic
                 .as_ref()
@@ -159,6 +159,7 @@ struct PythonJsonMain {
     optimizations: String,
     python_tag: String,
     python_abi_tag: Option<String>,
+    python_config_vars: HashMap<String, String>,
     python_platform_tag: String,
     python_implementation_cache_tag: String,
     python_implementation_hex_version: u64,
@@ -167,12 +168,17 @@ struct PythonJsonMain {
     python_version: String,
     python_major_minor_version: String,
     python_paths: HashMap<String, String>,
+    python_paths_abstract: HashMap<String, String>,
     python_exe: String,
     python_stdlib_test_packages: Vec<String>,
     python_suffixes: HashMap<String, Vec<String>>,
     python_bytecode_magic_number: String,
     python_symbol_visibility: String,
     python_extension_module_loading: Vec<String>,
+    apple_sdk_canonical_name: Option<String>,
+    apple_sdk_platform: Option<String>,
+    apple_sdk_version: Option<String>,
+    apple_sdk_deployment_target: Option<String>,
     libpython_link_mode: String,
     crt_features: Vec<String>,
     run_tests: String,
@@ -201,9 +207,9 @@ fn parse_python_json(path: &Path) -> Result<PythonJsonMain> {
                 .as_str()
                 .ok_or_else(|| anyhow!("unable to parse version as a string"))?;
 
-            if version != "5" {
+            if version != "7" {
                 return Err(anyhow!(
-                    "expected version 5 standalone distribution; found version {}",
+                    "expected version 7 standalone distribution; found version {}",
                     version
                 ));
             }
@@ -292,7 +298,7 @@ pub fn invoke_python(python_paths: &PythonPaths, logger: &slog::Logger, args: &[
 
     info!(logger, "setting PYTHONPATH {}", site_packages_s);
 
-    let mut envs: HashMap<String, String, RandomState> = HashMap::from_iter(std::env::vars());
+    let mut envs: HashMap<String, String, RandomState> = std::env::vars().collect();
     envs.insert("PYTHONPATH".to_string(), site_packages_s);
 
     info!(
@@ -319,17 +325,6 @@ pub fn invoke_python(python_paths: &PythonPaths, logger: &slog::Logger, args: &[
             warn!(logger, "{}", line.unwrap());
         }
     }
-}
-
-/// Describes license information for a library.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LicenseInfo {
-    /// SPDX license shortnames.
-    pub licenses: Vec<String>,
-    /// Suggested filename for the license.
-    pub license_filename: String,
-    /// Text of the license.
-    pub license_text: String,
 }
 
 /// Describes how libpython is linked in a standalone distribution.
@@ -386,6 +381,12 @@ pub struct StandaloneDistribution {
     /// Capabilities of distribution to load extension modules.
     extension_module_loading: Vec<String>,
 
+    /// Apple SDK build/targeting settings.
+    apple_sdk_info: Option<AppleSdkInfo>,
+
+    /// Holds license information for the core distribution.
+    pub core_license: Option<LicensedComponent>,
+
     /// SPDX license shortnames that apply to this distribution.
     ///
     /// Licenses only cover the core distribution. Licenses for libraries
@@ -397,7 +398,10 @@ pub struct StandaloneDistribution {
     pub license_path: Option<PathBuf>,
 
     /// Path to Tcl library files.
-    pub tcl_library_path: Option<PathBuf>,
+    tcl_library_path: Option<PathBuf>,
+
+    /// Directories under `tcl_library_path` containing tcl files.
+    tcl_library_paths: Option<Vec<String>>,
 
     /// Object files providing the core Python implementation.
     ///
@@ -426,7 +430,7 @@ pub struct StandaloneDistribution {
     ///
     /// Keys are library names, without the "lib" prefix or file extension.
     /// Values are filesystem paths where library is located.
-    pub libraries: BTreeMap<String, DataLocation>,
+    pub libraries: BTreeMap<String, FileData>,
 
     pub py_modules: BTreeMap<String, PathBuf>,
 
@@ -435,9 +439,6 @@ pub struct StandaloneDistribution {
     /// Keys are package names. Values are maps of resource name to data for the resource
     /// within that package.
     pub resources: BTreeMap<String, BTreeMap<String, PathBuf>>,
-
-    /// Describes license info for things in this distribution.
-    pub license_infos: BTreeMap<String, Vec<python_packaging::licensing::LicenseInfo>>,
 
     /// Path to copy of hacked dist to use for packaging rules venvs
     pub venv_base: PathBuf,
@@ -450,11 +451,14 @@ pub struct StandaloneDistribution {
 
     /// Tag to apply to bytecode files.
     ///
-    /// e.g. `cpython-37`.
+    /// e.g. `cpython-39`.
     pub cache_tag: String,
 
     /// Suffixes for Python module types.
     module_suffixes: PythonModuleSuffixes,
+
+    /// List of strings denoting C Runtime requirements.
+    pub crt_features: Vec<String>,
 }
 
 impl StandaloneDistribution {
@@ -609,12 +613,10 @@ impl StandaloneDistribution {
         let mut extension_modules: BTreeMap<String, PythonExtensionModuleVariants> =
             BTreeMap::new();
         let mut includes: BTreeMap<String, PathBuf> = BTreeMap::new();
-        let mut libraries: BTreeMap<String, DataLocation> = BTreeMap::new();
+        let mut libraries: BTreeMap<String, FileData> = BTreeMap::new();
         let frozen_c: Vec<u8> = Vec::new();
         let mut py_modules: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut resources: BTreeMap<String, BTreeMap<String, PathBuf>> = BTreeMap::new();
-        let mut license_infos: BTreeMap<String, Vec<python_packaging::licensing::LicenseInfo>> =
-            BTreeMap::new();
 
         for entry in std::fs::read_dir(dist_dir)? {
             let entry = entry?;
@@ -656,20 +658,22 @@ impl StandaloneDistribution {
 
         let pi = parse_python_json_from_distribution(dist_dir)?;
 
+        let mut core_license = None;
+
         if let Some(ref python_license_path) = pi.license_path {
             let license_path = python_path.join(python_license_path);
             let license_text = std::fs::read_to_string(&license_path).with_context(|| {
                 format!("unable to read Python license {}", license_path.display())
             })?;
 
-            let mut licenses = Vec::new();
-            licenses.push(python_packaging::licensing::LicenseInfo {
-                licenses: pi.licenses.clone().unwrap(),
-                license_filename: "LICENSE.python.txt".to_string(),
-                license_text,
-            });
+            let expression = pi.licenses.clone().unwrap().join(" OR ");
+            let mut component =
+                LicensedComponent::new_spdx(&pi.python_implementation_name, &expression)?;
 
-            license_infos.insert("python".to_string(), licenses);
+            component.set_flavor(ComponentFlavor::Library);
+            component.add_license_text(license_text);
+
+            core_license.replace(component);
         }
 
         // Collect object files for libpython.
@@ -736,7 +740,7 @@ impl StandaloneDistribution {
                 let object_file_data = entry
                     .objs
                     .iter()
-                    .map(|p| DataLocation::Path(python_path.join(p)))
+                    .map(|p| FileData::Path(python_path.join(p)))
                     .collect();
                 let mut links = Vec::new();
 
@@ -750,39 +754,41 @@ impl StandaloneDistribution {
                     links.push(depends);
                 }
 
-                let licenses = if let Some(ref license_paths) = entry.license_paths {
-                    let mut licenses = Vec::new();
-
-                    for license_path in license_paths {
-                        let license_path = python_path.join(license_path);
-                        let license_text = std::fs::read_to_string(&license_path)
-                            .with_context(|| "unable to read license file")?;
-
-                        licenses.push(python_packaging::licensing::LicenseInfo {
-                            licenses: entry.licenses.clone().unwrap(),
-                            license_filename: license_path
-                                .file_name()
-                                .unwrap()
-                                .to_str()
-                                .unwrap()
-                                .to_string(),
-                            license_text,
-                        });
-                    }
-
-                    license_infos.insert(module.clone(), licenses.clone());
-
-                    Some(licenses)
+                let mut license = if entry.license_public_domain.unwrap_or(false) {
+                    LicensedComponent::new_public_domain(module)
+                } else if let Some(licenses) = &entry.licenses {
+                    let expression = licenses.join(" OR ");
+                    LicensedComponent::new_spdx(module, &expression)?
+                } else if let Some(core) = &core_license {
+                    LicensedComponent::new_spdx(
+                        module,
+                        &core
+                            .spdx_expression()
+                            .ok_or_else(|| anyhow!("could not resolve SPDX license for core"))?
+                            .to_string(),
+                    )?
                 } else {
-                    None
+                    LicensedComponent::new_none(module)
                 };
+
+                license.set_flavor(ComponentFlavor::PythonPackage);
+
+                if let Some(license_paths) = &entry.license_paths {
+                    for path in license_paths {
+                        let path = python_path.join(path);
+                        let text = std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+
+                        license.add_license_text(text);
+                    }
+                }
 
                 ems.push(PythonExtensionModule {
                     name: module.clone(),
                     init_fn: Some(entry.init_fn.clone()),
                     extension_file_suffix,
                     shared_library: if let Some(path) = &entry.shared_lib {
-                        Some(DataLocation::Path(python_path.join(path)))
+                        Some(FileData::Path(python_path.join(path)))
                     } else {
                         None
                     },
@@ -793,8 +799,7 @@ impl StandaloneDistribution {
                     builtin_default: entry.in_core,
                     required: entry.required,
                     variant: Some(entry.variant.clone()),
-                    licenses,
-                    license_public_domain: entry.license_public_domain,
+                    license: Some(license),
                 });
             }
 
@@ -840,8 +845,8 @@ impl StandaloneDistribution {
                     resources.get_mut(&resource.leaf_package).unwrap().insert(
                         resource.relative_name.clone(),
                         match &resource.data {
-                            DataLocation::Path(path) => path.to_path_buf(),
-                            DataLocation::Memory(_) => {
+                            FileData::Path(path) => path.to_path_buf(),
+                            FileData::Memory(_) => {
                                 return Err(anyhow!(
                                     "should not have received in-memory resource data"
                                 ))
@@ -850,10 +855,10 @@ impl StandaloneDistribution {
                     );
                 }
                 PythonResource::ModuleSource(source) => match &source.source {
-                    DataLocation::Path(path) => {
+                    FileData::Path(path) => {
                         py_modules.insert(source.name.clone(), path.to_path_buf());
                     }
-                    DataLocation::Memory(_) => {
+                    FileData::Memory(_) => {
                         return Err(anyhow!("should not have received in-memory source data"))
                     }
                 },
@@ -881,6 +886,27 @@ impl StandaloneDistribution {
             return Err(anyhow!("unhandled link mode: {}", pi.libpython_link_mode));
         };
 
+        let apple_sdk_info = if let Some(canonical_name) = pi.apple_sdk_canonical_name {
+            let platform = pi
+                .apple_sdk_platform
+                .ok_or_else(|| anyhow!("apple_sdk_platform not defined"))?;
+            let version = pi
+                .apple_sdk_version
+                .ok_or_else(|| anyhow!("apple_sdk_version not defined"))?;
+            let deployment_target = pi
+                .apple_sdk_deployment_target
+                .ok_or_else(|| anyhow!("apple_sdk_deployment_target not defined"))?;
+
+            Some(AppleSdkInfo {
+                canonical_name,
+                platform,
+                version,
+                deployment_target,
+            })
+        } else {
+            None
+        };
+
         let inittab_object = python_path.join(pi.build_info.inittab_object);
 
         Ok(Self {
@@ -897,16 +923,18 @@ impl StandaloneDistribution {
             link_mode,
             python_symbol_visibility: pi.python_symbol_visibility,
             extension_module_loading: pi.python_extension_module_loading,
+            apple_sdk_info,
+            core_license,
             licenses: pi.licenses.clone(),
             license_path: match pi.license_path {
                 Some(ref path) => Some(PathBuf::from(path)),
                 None => None,
             },
             tcl_library_path: match pi.tcl_library_path {
-                Some(ref path) => Some(PathBuf::from(path)),
+                Some(ref path) => Some(dist_dir.join("python").join(path)),
                 None => None,
             },
-
+            tcl_library_paths: pi.tcl_library_paths.clone(),
             extension_modules,
             frozen_c,
             includes,
@@ -916,12 +944,12 @@ impl StandaloneDistribution {
             libpython_shared_library,
             py_modules,
             resources,
-            license_infos,
             venv_base,
             inittab_object,
             inittab_cflags: pi.build_info.inittab_cflags,
             cache_tag: pi.python_implementation_cache_tag,
             module_suffixes,
+            crt_features: pi.crt_features,
         })
     }
 
@@ -963,7 +991,8 @@ impl StandaloneDistribution {
         if !venv_base.exists() {
             let dist_prefix = self.base_dir.join("python").join("install");
 
-            copy_dir(&dist_prefix, &venv_base).unwrap();
+            let options = fs_extra::dir::CopyOptions::new();
+            fs_extra::dir::copy(&dist_prefix, &venv_base, &options).unwrap();
 
             let dist_prefix_s = dist_prefix.display().to_string();
             warn!(
@@ -1063,6 +1092,7 @@ impl PythonDistribution for StandaloneDistribution {
                 "x86_64-unknown-linux-gnu" => vec![],
                 // musl libc linked distributions run on GNU Linux.
                 "x86_64-unknown-linux-musl" => vec!["x86_64-unknown-linux-gnu"],
+                "aarch64-apple-darwin" => vec![],
                 "x86_64-apple-darwin" => vec![],
                 // 32-bit Windows GNU on 32-bit Windows MSVC and 64-bit Windows.
                 "i686-pc-windows-gnu" => vec![
@@ -1123,7 +1153,7 @@ impl PythonDistribution for StandaloneDistribution {
     fn python_abi_tag(&self) -> Option<&str> {
         match &self.python_abi_tag {
             Some(tag) => {
-                if tag == "" {
+                if tag.is_empty() {
                     None
                 } else {
                     Some(tag)
@@ -1147,6 +1177,7 @@ impl PythonDistribution for StandaloneDistribution {
             "linux-x86_64" => "manylinux2014_x86_64",
             "linux-i686" => "manylinux2014_i686",
             "macosx-10.9-x86_64" => "macosx_10_9_x86_64",
+            "macosx-11.0-arm64" => "macosx_11_0_arm64",
             "win-amd64" => "win_amd64",
             "win32" => "win32",
             p => panic!("unsupported Python platform: {}", p),
@@ -1165,8 +1196,16 @@ impl PythonDistribution for StandaloneDistribution {
         self.stdlib_test_packages.clone()
     }
 
+    fn apple_sdk_info(&self) -> Option<&AppleSdkInfo> {
+        self.apple_sdk_info.as_ref()
+    }
+
     fn create_bytecode_compiler(&self) -> Result<Box<dyn PythonBytecodeCompiler>> {
-        Ok(Box::new(BytecodeCompiler::new(&self.python_exe)?))
+        let temp_dir = tempfile::TempDir::new()?;
+        Ok(Box::new(BytecodeCompiler::new(
+            &self.python_exe,
+            temp_dir.path(),
+        )?))
     }
 
     fn create_packaging_policy(&self) -> Result<PythonPackagingPolicy> {
@@ -1196,19 +1235,19 @@ impl PythonDistribution for StandaloneDistribution {
         Ok(policy)
     }
 
-    fn create_python_interpreter_config(&self) -> Result<EmbeddedPythonConfig> {
-        let embedded_default = EmbeddedPythonConfig::default();
+    fn create_python_interpreter_config(&self) -> Result<PyembedPythonInterpreterConfig> {
+        let embedded_default = PyembedPythonInterpreterConfig::default();
 
-        Ok(EmbeddedPythonConfig {
+        Ok(PyembedPythonInterpreterConfig {
             config: PythonInterpreterConfig {
                 profile: PythonInterpreterProfile::Isolated,
                 ..embedded_default.config
             },
-            raw_allocator: default_raw_allocator(self.target_triple()),
+            allocator_backend: default_memory_allocator(self.target_triple()),
+            allocator_raw: true,
             oxidized_importer: true,
             filesystem_importer: false,
             terminfo_resolution: TerminfoResolution::Dynamic,
-            run_mode: PythonRunMode::Repl,
             ..embedded_default
         })
     }
@@ -1221,7 +1260,7 @@ impl PythonDistribution for StandaloneDistribution {
         name: &str,
         libpython_link_mode: BinaryLibpythonLinkMode,
         policy: &PythonPackagingPolicy,
-        config: &EmbeddedPythonConfig,
+        config: &PyembedPythonInterpreterConfig,
         host_distribution: Option<Arc<dyn PythonDistribution>>,
     ) -> Result<Box<dyn PythonBinaryBuilder>> {
         // TODO can we avoid these clones?
@@ -1253,7 +1292,7 @@ impl PythonDistribution for StandaloneDistribution {
         let module_sources = self.py_modules.iter().map(|(name, path)| {
             PythonResource::from(PythonModuleSource {
                 name: name.clone(),
-                source: DataLocation::Path(path.clone()),
+                source: FileData::Path(path.clone()),
                 is_package: is_package_from_path(&path),
                 cache_tag: self.cache_tag.clone(),
                 is_stdlib: true,
@@ -1269,7 +1308,7 @@ impl PythonDistribution for StandaloneDistribution {
                     PythonResource::from(PythonPackageResource {
                         leaf_package: package.clone(),
                         relative_name: name.clone(),
-                        data: DataLocation::Path(path.clone()),
+                        data: FileData::Path(path.clone()),
                         is_stdlib: true,
                         is_test: self.is_stdlib_test_package(&package),
                     })
@@ -1328,11 +1367,53 @@ impl PythonDistribution for StandaloneDistribution {
                 .extension_module_loading
                 .contains(&"shared-library".to_string())
     }
+
+    fn tcl_files(&self) -> Result<Vec<(PathBuf, FileData)>> {
+        let mut res = vec![];
+
+        if let Some(root) = &self.tcl_library_path {
+            if let Some(paths) = &self.tcl_library_paths {
+                for subdir in paths {
+                    for entry in walkdir::WalkDir::new(root.join(subdir))
+                        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
+                        .into_iter()
+                    {
+                        let entry = entry?;
+
+                        let path = entry.path();
+
+                        if path.is_dir() {
+                            continue;
+                        }
+
+                        let rel_path = path.strip_prefix(&root)?;
+
+                        res.push((rel_path.to_path_buf(), path.into()));
+                    }
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
+    fn tcl_library_path_directory(&self) -> Option<String> {
+        // TODO this should probably be exposed from the JSON metadata.
+        Some("tcl8.6".to_string())
+    }
 }
 
 #[cfg(test)]
 pub mod tests {
-    use {super::*, crate::testutil::*};
+    use {
+        super::*,
+        crate::testutil::*,
+        python_packaging::{
+            bytecode::CompileMode, policy::ExtensionModuleFilter,
+            resource::BytecodeOptimizationLevel,
+        },
+        std::collections::BTreeSet,
+    };
 
     #[test]
     fn test_stdlib_annotations() -> Result<()> {
@@ -1354,6 +1435,133 @@ pub mod tests {
                     }
                 }
                 _ => (),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tcl_files() -> Result<()> {
+        for dist in get_all_standalone_distributions()? {
+            let tcl_files = dist.tcl_files()?;
+
+            if dist.target_triple().contains("pc-windows")
+                && !dist.is_extension_module_file_loadable()
+            {
+                assert!(tcl_files.is_empty());
+            } else {
+                assert!(!tcl_files.is_empty());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extension_module_copyleft_filtering() -> Result<()> {
+        for dist in get_all_standalone_distributions()? {
+            let mut policy = dist.create_packaging_policy()?;
+            policy.set_extension_module_filter(ExtensionModuleFilter::All);
+
+            let all_extensions = policy
+                .resolve_python_extension_modules(
+                    dist.extension_modules.values(),
+                    &dist.target_triple,
+                )?
+                .into_iter()
+                .map(|e| (e.name, e.variant))
+                .collect::<BTreeSet<_>>();
+
+            policy.set_extension_module_filter(ExtensionModuleFilter::NoCopyleft);
+
+            let no_copyleft_extensions = policy
+                .resolve_python_extension_modules(
+                    dist.extension_modules.values(),
+                    &dist.target_triple,
+                )?
+                .into_iter()
+                .map(|e| (e.name, e.variant))
+                .collect::<BTreeSet<_>>();
+
+            let dropped = all_extensions
+                .difference(&no_copyleft_extensions)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let added = no_copyleft_extensions
+                .difference(&all_extensions)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let linux_dropped = vec![
+                ("_gdbm".to_string(), Some("default".to_string())),
+                ("readline".to_string(), Some("default".to_string())),
+            ];
+
+            let linux_added = vec![("readline".to_string(), Some("libedit".to_string()))];
+
+            let (wanted_dropped, wanted_added) = match (
+                dist.python_major_minor_version().as_str(),
+                dist.target_triple(),
+            ) {
+                (_, "x86_64-unknown-linux-gnu") => (linux_dropped.clone(), linux_added.clone()),
+                (_, "x86_64-unknown-linux-musl") => (linux_dropped.clone(), linux_added.clone()),
+                (_, "i686-pc-windows-msvc") => (vec![], vec![]),
+                (_, "x86_64-pc-windows-msvc") => (vec![], vec![]),
+                (_, "aarch64-apple-darwin") => (vec![], vec![]),
+                (_, "x86_64-apple-darwin") => (vec![], vec![]),
+                _ => (vec![], vec![]),
+            };
+
+            assert_eq!(
+                dropped,
+                wanted_dropped,
+                "dropped matches for {} {}",
+                dist.python_major_minor_version(),
+                dist.target_triple(),
+            );
+            assert_eq!(
+                added,
+                wanted_added,
+                "added matches for {} {}",
+                dist.python_major_minor_version(),
+                dist.target_triple()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn compile_syntax_error() -> Result<()> {
+        let dist = get_default_distribution()?;
+
+        let temp_dir = tempfile::TempDir::new()?;
+
+        let mut compiler = BytecodeCompiler::new(dist.python_exe_path(), temp_dir.path())?;
+        let res = compiler.compile(
+            b"invalid syntax",
+            "foo.py",
+            BytecodeOptimizationLevel::Zero,
+            CompileMode::Bytecode,
+        );
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(err
+            .to_string()
+            .starts_with("compiling error: invalid syntax"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn apple_sdk_info() -> Result<()> {
+        for dist in get_all_standalone_distributions()? {
+            if dist.target_triple().contains("-apple-") {
+                assert!(dist.apple_sdk_info().is_some());
+            } else {
+                assert!(dist.apple_sdk_info().is_none());
             }
         }
 

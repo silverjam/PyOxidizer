@@ -8,16 +8,14 @@ Building a native binary containing Python.
 
 use {
     anyhow::{anyhow, Result},
-    python_packaging::{
-        libpython::LibPythonBuildContext, licensing::LicenseInfo, resource::DataLocation,
-    },
+    python_packaging::libpython::LibPythonBuildContext,
     slog::warn,
     std::{
-        collections::BTreeMap,
         fs,
         fs::create_dir_all,
         path::{Path, PathBuf},
     },
+    tugger_file_manifest::FileData,
 };
 
 /// Produce the content of the config.c file containing built-in extensions.
@@ -27,9 +25,7 @@ where
 {
     // It is easier to construct the file from scratch than parse the template
     // and insert things in the right places.
-    let mut lines: Vec<String> = Vec::new();
-
-    lines.push(String::from("#include \"Python.h\""));
+    let mut lines: Vec<String> = vec!["#include \"Python.h\"".to_string()];
 
     // Declare the initialization functions.
     for (_name, init_fn) in extensions {
@@ -55,7 +51,6 @@ pub struct LibpythonInfo {
     pub libpython_path: PathBuf,
     pub libpyembeddedconfig_path: PathBuf,
     pub cargo_metadata: Vec<String>,
-    pub license_infos: BTreeMap<String, Vec<LicenseInfo>>,
 }
 
 /// Create a static libpython from a Python distribution.
@@ -71,7 +66,7 @@ pub fn link_libpython(
 ) -> Result<LibpythonInfo> {
     let mut cargo_metadata: Vec<String> = Vec::new();
 
-    let temp_dir = tempdir::TempDir::new("libpython")?;
+    let temp_dir = tempfile::Builder::new().prefix("libpython").tempdir()?;
     let temp_dir_path = temp_dir.path();
 
     let windows = crate::environment::WINDOWS_TARGET_TRIPLES.contains(&target_triple);
@@ -147,12 +142,12 @@ pub fn link_libpython(
 
     for (i, location) in context.object_files.iter().enumerate() {
         match location {
-            DataLocation::Memory(data) => {
+            FileData::Memory(data) => {
                 let out_path = temp_dir_path.join(format!("libpython.{}.o", i));
                 fs::write(&out_path, data)?;
                 build.object(&out_path);
             }
-            DataLocation::Path(p) => {
+            FileData::Path(p) => {
                 build.object(&p);
             }
         }
@@ -172,6 +167,20 @@ pub fn link_libpython(
 
     for lib in &context.static_libraries {
         cargo_metadata.push(format!("cargo:rustc-link-lib=static={}", lib));
+    }
+
+    // Python 3.9+ on macOS uses __builtin_available(), which requires
+    // ___isOSVersionAtLeast(), which is part of libclang_rt. However,
+    // libclang_rt isn't linked by default by Rust. So unless something else
+    // pulls it in, we'll get unresolved symbol errors when attempting to link
+    // the final binary. Our solution to this is to always annotate
+    // `clang_rt.<platform>` as a library dependency of our static libpython.
+    if target_triple.ends_with("-apple-darwin") {
+        if let Some(path) = macos_clang_search_path()? {
+            cargo_metadata.push(format!("cargo:rustc-link-search={}", path.display()));
+        }
+
+        cargo_metadata.push("cargo:rustc-link-lib=clang_rt.osx".to_string());
     }
 
     // python3-sys uses #[link(name="pythonXY")] attributes heavily on Windows. Its
@@ -214,6 +223,27 @@ pub fn link_libpython(
         libpython_path,
         libpyembeddedconfig_path,
         cargo_metadata,
-        license_infos: context.license_infos.clone(),
     })
+}
+
+/// Attempt to resolve the linker search path for clang libraries.
+fn macos_clang_search_path() -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("clang")
+        .arg("--print-search-dirs")
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.contains("libraries: =") {
+            let path = line
+                .split('=')
+                .nth(1)
+                .ok_or_else(|| anyhow!("could not parse libraries line"))?;
+            return Ok(Some(PathBuf::from(path).join("lib").join("darwin")));
+        }
+    }
+
+    Ok(None)
 }

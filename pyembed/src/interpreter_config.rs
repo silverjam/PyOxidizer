@@ -5,45 +5,25 @@
 //! Utilities for configuring a Python interpreter.
 
 use {
-    super::config::OxidizedPythonInterpreterConfig,
+    crate::{config::ResolvedOxidizedPythonInterpreterConfig, NewInterpreterError},
     libc::{c_int, size_t, wchar_t},
     python3_sys as pyffi,
     python_packaging::{
-        interpreter::{
-            CheckHashPYCsMode, PythonInterpreterConfig, PythonInterpreterProfile, PythonRunMode,
-        },
+        interpreter::{CheckHashPycsMode, PythonInterpreterConfig, PythonInterpreterProfile},
         resource::BytecodeOptimizationLevel,
     },
-    std::convert::TryInto,
-    std::ffi::{CStr, CString, OsStr},
-    std::path::Path,
+    std::{
+        convert::{TryFrom, TryInto},
+        ffi::{CString, OsString},
+        path::Path,
+    },
 };
 
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+#[cfg(target_family = "unix")]
+use std::{ffi::NulError, os::unix::ffi::OsStrExt};
 
 #[cfg(target_family = "windows")]
 use std::os::windows::prelude::OsStrExt;
-
-fn py_status_to_string(status: &pyffi::PyStatus, context: &str) -> String {
-    if !status.func.is_null() && !status.err_msg.is_null() {
-        let func = unsafe { CStr::from_ptr(status.func) };
-        let msg = unsafe { CStr::from_ptr(status.err_msg) };
-
-        format!(
-            "during {}: {}: {}",
-            context,
-            func.to_string_lossy(),
-            msg.to_string_lossy()
-        )
-    } else if !status.err_msg.is_null() {
-        let msg = unsafe { CStr::from_ptr(status.err_msg) };
-
-        format!("during {}: {}", context, msg.to_string_lossy())
-    } else {
-        format!("during {}: could not format PyStatus", context)
-    }
-}
 
 /// Set a PyConfig string value from a str.
 fn set_config_string_from_str(
@@ -51,7 +31,7 @@ fn set_config_string_from_str(
     dest: &*mut wchar_t,
     value: &str,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), NewInterpreterError> {
     match CString::new(value) {
         Ok(value) => unsafe {
             let status = pyffi::PyConfig_SetBytesString(
@@ -60,15 +40,15 @@ fn set_config_string_from_str(
                 value.as_ptr(),
             );
             if pyffi::PyStatus_Exception(status) != 0 {
-                Err(py_status_to_string(&status, context))
+                Err(NewInterpreterError::new_from_pystatus(&status, context))
             } else {
                 Ok(())
             }
         },
-        Err(_) => Err(format!(
+        Err(_) => Err(NewInterpreterError::Dynamic(format!(
             "during {}: unable to convert {} to C string",
             context, value
-        )),
+        ))),
     }
 }
 
@@ -78,9 +58,9 @@ fn set_config_string_from_path(
     dest: &*mut wchar_t,
     path: &Path,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), NewInterpreterError> {
     let value = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "cannot convert path to C string".to_string())?;
+        .map_err(|_| NewInterpreterError::Simple("cannot convert path to C string"))?;
 
     let status = unsafe {
         pyffi::PyConfig_SetBytesString(
@@ -91,7 +71,7 @@ fn set_config_string_from_path(
     };
 
     if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(py_status_to_string(&status, context))
+        Err(NewInterpreterError::new_from_pystatus(&status, context))
     } else {
         Ok(())
     }
@@ -103,7 +83,7 @@ fn set_config_string_from_path(
     dest: &*mut wchar_t,
     path: &Path,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), NewInterpreterError> {
     let status = unsafe {
         let mut value: Vec<wchar_t> = path.as_os_str().encode_wide().collect();
         // NULL terminate.
@@ -117,7 +97,7 @@ fn set_config_string_from_path(
     };
 
     if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(py_status_to_string(&status, context))
+        Err(NewInterpreterError::new_from_pystatus(&status, context))
     } else {
         Ok(())
     }
@@ -128,16 +108,19 @@ fn append_wide_string_list_from_str(
     dest: &mut pyffi::PyWideStringList,
     value: &str,
     context: &str,
-) -> Result<(), String> {
-    let value =
-        CString::new(value).map_err(|_| "unable to convert value to C string".to_string())?;
+) -> Result<(), NewInterpreterError> {
+    let value = CString::new(value)
+        .map_err(|_| NewInterpreterError::Simple("unable to convert value to C string"))?;
 
     let mut len: size_t = 0;
 
     let decoded = unsafe { pyffi::Py_DecodeLocale(value.as_ptr() as *const _, &mut len) };
 
     if decoded.is_null() {
-        Err(format!("during {}: unable to decode value", context))
+        Err(NewInterpreterError::Dynamic(format!(
+            "during {}: unable to decode value",
+            context
+        )))
     } else {
         let status = unsafe { pyffi::PyWideStringList_Append(dest as *mut _, decoded) };
         unsafe {
@@ -145,7 +128,7 @@ fn append_wide_string_list_from_str(
         }
 
         if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-            Err(py_status_to_string(&status, context))
+            Err(NewInterpreterError::new_from_pystatus(&status, context))
         } else {
             Ok(())
         }
@@ -157,11 +140,11 @@ fn append_wide_string_list_from_path(
     dest: &mut pyffi::PyWideStringList,
     path: &Path,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), NewInterpreterError> {
     let value = path
         .as_os_str()
         .to_str()
-        .ok_or_else(|| "unable to convert value to str".to_string())?;
+        .ok_or_else(|| NewInterpreterError::Simple("unable to convert value to str"))?;
 
     append_wide_string_list_from_str(dest, value, context)
 }
@@ -171,7 +154,7 @@ fn append_wide_string_list_from_path(
     dest: &mut pyffi::PyWideStringList,
     path: &Path,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), NewInterpreterError> {
     let status = unsafe {
         let mut value: Vec<wchar_t> = path.as_os_str().encode_wide().collect();
         // NULL terminate.
@@ -181,39 +164,7 @@ fn append_wide_string_list_from_path(
     };
 
     if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(py_status_to_string(&status, context))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn append_wide_string_list_from_osstr(
-    dest: &mut pyffi::PyWideStringList,
-    value: &OsStr,
-    context: &str,
-) -> Result<(), String> {
-    let value = String::from_utf8(value.as_bytes().into())
-        .map_err(|_| "unable to convert value to str".to_string())?;
-    append_wide_string_list_from_str(dest, &value, context)
-}
-
-#[cfg(windows)]
-fn append_wide_string_list_from_osstr(
-    dest: &mut pyffi::PyWideStringList,
-    value: &OsStr,
-    context: &str,
-) -> Result<(), String> {
-    let status = unsafe {
-        let mut value: Vec<wchar_t> = value.encode_wide().collect();
-        // NULL terminate.
-        value.push(0);
-
-        pyffi::PyWideStringList_Append(dest as *mut _, value.as_ptr() as *const _)
-    };
-
-    if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(py_status_to_string(&status, context))
+        Err(NewInterpreterError::new_from_pystatus(&status, context))
     } else {
         Ok(())
     }
@@ -235,78 +186,122 @@ fn set_legacy_windows_stdio(config: &mut pyffi::PyConfig, value: bool) {
     config.legacy_windows_stdio = if value { 1 } else { 0 };
 }
 
-impl<'a> OxidizedPythonInterpreterConfig<'a> {
-    /// Whether the run configuration should execute via Py_RunMain().
-    pub(crate) fn uses_py_runmain(&self) -> bool {
-        if self.interpreter_config.run_command.is_some()
-            || self.interpreter_config.run_filename.is_some()
-            || self.interpreter_config.run_module.is_some()
-        {
-            true
-        } else {
-            match &self.run {
-                PythonRunMode::Eval { .. } => true,
-                PythonRunMode::File { .. } => true,
-                PythonRunMode::Module { .. } => true,
-                PythonRunMode::Repl => true,
-                PythonRunMode::None => false,
-            }
-        }
+#[cfg(target_family = "unix")]
+pub fn set_argv(
+    config: &mut pyffi::PyConfig,
+    args: &[OsString],
+) -> Result<(), NewInterpreterError> {
+    let argc = args.len() as isize;
+    let argv = args
+        .iter()
+        .map(|x| CString::new(x.as_bytes()))
+        .collect::<Result<Vec<_>, NulError>>()
+        .map_err(|_| NewInterpreterError::Simple("unable to construct C string from OsString"))?;
+    let argvp = argv
+        .iter()
+        .map(|x| x.as_ptr() as *mut i8)
+        .collect::<Vec<_>>();
+
+    let status = unsafe { pyffi::PyConfig_SetBytesArgv(config as *mut _, argc, argvp.as_ptr()) };
+
+    if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
+        Err(NewInterpreterError::new_from_pystatus(
+            &status,
+            "setting argv",
+        ))
+    } else {
+        Ok(())
     }
 }
 
-pub fn python_interpreter_config_to_py_pre_config(
-    value: &PythonInterpreterConfig,
-) -> Result<pyffi::PyPreConfig, String> {
-    let mut pre_config = pyffi::PyPreConfig::default();
-    unsafe {
-        match value.profile {
-            PythonInterpreterProfile::Python => {
-                pyffi::PyPreConfig_InitPythonConfig(&mut pre_config)
-            }
-            PythonInterpreterProfile::Isolated => {
-                pyffi::PyPreConfig_InitIsolatedConfig(&mut pre_config)
+#[cfg(target_family = "windows")]
+pub fn set_argv(
+    config: &mut pyffi::PyConfig,
+    args: &[OsString],
+) -> Result<(), NewInterpreterError> {
+    let argc = args.len() as isize;
+    let argv = args
+        .iter()
+        .map(|x| {
+            let mut buffer = x.encode_wide().collect::<Vec<u16>>();
+            buffer.push(0);
+
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let argvp = argv
+        .iter()
+        .map(|x| x.as_ptr() as *mut u16)
+        .collect::<Vec<_>>();
+
+    let status = unsafe { pyffi::PyConfig_SetArgv(config as *mut _, argc, argvp.as_ptr()) };
+
+    if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
+        Err(NewInterpreterError::new_from_pystatus(
+            &status,
+            "setting argv",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+impl<'a> TryFrom<&ResolvedOxidizedPythonInterpreterConfig<'a>> for pyffi::PyPreConfig {
+    type Error = NewInterpreterError;
+
+    fn try_from(config: &ResolvedOxidizedPythonInterpreterConfig<'a>) -> Result<Self, Self::Error> {
+        let value = &config.interpreter_config;
+
+        let mut pre_config = pyffi::PyPreConfig::default();
+        unsafe {
+            match value.profile {
+                PythonInterpreterProfile::Python => {
+                    pyffi::PyPreConfig_InitPythonConfig(&mut pre_config)
+                }
+                PythonInterpreterProfile::Isolated => {
+                    pyffi::PyPreConfig_InitIsolatedConfig(&mut pre_config)
+                }
             }
         }
-    }
 
-    if let Some(parse_argv) = value.parse_argv {
-        pre_config.parse_argv = if parse_argv { 1 } else { 0 };
-    }
-    if let Some(isolated) = value.isolated {
-        pre_config.isolated = if isolated { 1 } else { 0 };
-    }
-    if let Some(use_environment) = value.use_environment {
-        pre_config.use_environment = if use_environment { 1 } else { 0 };
-    }
-    if let Some(configure_locale) = value.configure_locale {
-        pre_config.configure_locale = if configure_locale { 1 } else { 0 };
-    }
-    if let Some(coerce_c_locale) = value.coerce_c_locale {
-        pre_config.coerce_c_locale = coerce_c_locale as c_int;
-    }
-    if let Some(coerce_c_locale_warn) = value.coerce_c_locale_warn {
-        pre_config.coerce_c_locale_warn = if coerce_c_locale_warn { 1 } else { 0 };
-    }
-    if let Some(legacy_windows_fs_encoding) = value.legacy_windows_fs_encoding {
-        set_windows_fs_encoding(&mut pre_config, legacy_windows_fs_encoding);
-    }
-    if let Some(utf8_mode) = value.utf8_mode {
-        pre_config.utf8_mode = if utf8_mode { 1 } else { 0 };
-    }
-    if let Some(dev_mode) = value.development_mode {
-        pre_config.dev_mode = if dev_mode { 1 } else { 0 };
-    }
-    if let Some(allocator) = value.allocator {
-        pre_config.allocator = allocator as c_int;
-    }
+        if let Some(parse_argv) = value.parse_argv {
+            pre_config.parse_argv = if parse_argv { 1 } else { 0 };
+        }
+        if let Some(isolated) = value.isolated {
+            pre_config.isolated = if isolated { 1 } else { 0 };
+        }
+        if let Some(use_environment) = value.use_environment {
+            pre_config.use_environment = if use_environment { 1 } else { 0 };
+        }
+        if let Some(configure_locale) = value.configure_locale {
+            pre_config.configure_locale = if configure_locale { 1 } else { 0 };
+        }
+        if let Some(coerce_c_locale) = value.coerce_c_locale {
+            pre_config.coerce_c_locale = coerce_c_locale as c_int;
+        }
+        if let Some(coerce_c_locale_warn) = value.coerce_c_locale_warn {
+            pre_config.coerce_c_locale_warn = if coerce_c_locale_warn { 1 } else { 0 };
+        }
+        if let Some(legacy_windows_fs_encoding) = value.legacy_windows_fs_encoding {
+            set_windows_fs_encoding(&mut pre_config, legacy_windows_fs_encoding);
+        }
+        if let Some(utf8_mode) = value.utf8_mode {
+            pre_config.utf8_mode = if utf8_mode { 1 } else { 0 };
+        }
+        if let Some(dev_mode) = value.development_mode {
+            pre_config.dev_mode = if dev_mode { 1 } else { 0 };
+        }
+        if let Some(allocator) = value.allocator {
+            pre_config.allocator = allocator as c_int;
+        }
 
-    Ok(pre_config)
+        Ok(pre_config)
+    }
 }
 
 pub fn python_interpreter_config_to_py_config(
     value: &PythonInterpreterConfig,
-) -> Result<pyffi::PyConfig, String> {
+) -> Result<pyffi::PyConfig, NewInterpreterError> {
     let mut config = pyffi::PyConfig::default();
     unsafe {
         match value.profile {
@@ -343,9 +338,6 @@ pub fn python_interpreter_config_to_py_config(
     if let Some(show_ref_count) = value.show_ref_count {
         config.show_ref_count = if show_ref_count { 1 } else { 0 };
     }
-    if let Some(show_alloc_coun) = value.show_alloc_count {
-        config.show_alloc_count = if show_alloc_coun { 1 } else { 0 };
-    }
     if let Some(dump_refs) = value.dump_refs {
         config.dump_refs = if dump_refs { 1 } else { 0 };
     }
@@ -380,9 +372,7 @@ pub fn python_interpreter_config_to_py_config(
         config.parse_argv = if parse_argv { 1 } else { 0 };
     }
     if let Some(argv) = &value.argv {
-        for value in argv {
-            append_wide_string_list_from_osstr(&mut config.argv, value, "setting argv")?;
-        }
+        set_argv(&mut config, argv)?;
     }
     if let Some(program_name) = &value.program_name {
         set_config_string_from_path(
@@ -471,9 +461,9 @@ pub fn python_interpreter_config_to_py_config(
             &config,
             &config.check_hash_pycs_mode,
             match check_hash_pycs_mode {
-                CheckHashPYCsMode::Always => "always",
-                CheckHashPYCsMode::Never => "never",
-                CheckHashPYCsMode::Default => "default",
+                CheckHashPycsMode::Always => "always",
+                CheckHashPycsMode::Never => "never",
+                CheckHashPycsMode::Default => "default",
             },
             "setting check_hash_pycs_mode",
         )?;
@@ -578,20 +568,28 @@ pub fn python_interpreter_config_to_py_config(
     Ok(config)
 }
 
-impl<'a> TryInto<pyffi::PyConfig> for &'a OxidizedPythonInterpreterConfig<'a> {
-    type Error = String;
+impl<'a> TryInto<pyffi::PyConfig> for &'a ResolvedOxidizedPythonInterpreterConfig<'a> {
+    type Error = NewInterpreterError;
 
     fn try_into(self) -> Result<pyffi::PyConfig, Self::Error> {
         // We use the raw configuration as a base then we apply any adjustments,
         // as needed.
-        let config: pyffi::PyConfig =
+        let mut config: pyffi::PyConfig =
             python_interpreter_config_to_py_config(&self.interpreter_config)?;
 
+        if let Some(argv) = &self.argv {
+            set_argv(&mut config, argv)?;
+        }
+
         if self.exe.is_none() {
-            return Err("current executable not set; must call ensure_origin() 1st".to_string());
+            return Err(NewInterpreterError::Simple(
+                "current executable not set; must call ensure_origin() 1st",
+            ));
         }
         if self.origin.is_none() {
-            return Err("origin not set; must call ensure_origin() 1st".to_string());
+            return Err(NewInterpreterError::Simple(
+                "origin not set; must call ensure_origin() 1st",
+            ));
         }
         let exe = self.exe.as_ref().unwrap();
         let origin = self.origin.as_ref().unwrap();
@@ -610,41 +608,6 @@ impl<'a> TryInto<pyffi::PyConfig> for &'a OxidizedPythonInterpreterConfig<'a> {
             // PYTHONHOME is set to directory of current executable.
             if self.interpreter_config.home.is_none() {
                 set_config_string_from_path(&config, &config.home, origin, "setting home")?;
-            }
-        }
-
-        match &self.run {
-            PythonRunMode::None => {}
-            PythonRunMode::Repl => {}
-            PythonRunMode::Eval { code } => {
-                if self.interpreter_config.run_command.is_none() {
-                    set_config_string_from_str(
-                        &config,
-                        &config.run_command,
-                        code,
-                        "setting run_command",
-                    )?;
-                }
-            }
-            PythonRunMode::File { path } => {
-                if self.interpreter_config.run_filename.is_none() {
-                    set_config_string_from_path(
-                        &config,
-                        &config.run_filename,
-                        path,
-                        "setting run_filename",
-                    )?;
-                }
-            }
-            PythonRunMode::Module { module } => {
-                if self.interpreter_config.run_module.is_none() {
-                    set_config_string_from_str(
-                        &config,
-                        &config.run_module,
-                        module,
-                        "setting run_module",
-                    )?;
-                }
             }
         }
 

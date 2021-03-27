@@ -8,22 +8,26 @@ Functionality for defining how Python resources should be packaged.
 
 use {
     crate::{
-        licensing::NON_GPL_LICENSES,
+        licensing::SAFE_SYSTEM_LIBRARIES,
         location::ConcreteResourceLocation,
         resource::{PythonExtensionModule, PythonExtensionModuleVariants, PythonResource},
         resource_collection::PythonResourceAddCollectionContext,
     },
     anyhow::Result,
-    std::{collections::HashMap, convert::TryFrom, iter::FromIterator},
+    std::{collections::HashMap, convert::TryFrom},
+    tugger_licensing::LicenseFlavor,
 };
 
 /// Denotes methods to filter extension modules.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExtensionModuleFilter {
+    /// Only use the minimum set of extension modules needed to initialize an interpreter.
     Minimal,
+    /// Use all extension modules.
     All,
+    /// Only use extension modules without library dependencies.
     NoLibraries,
-    NoGPL,
+    NoCopyleft,
 }
 
 impl TryFrom<&str> for ExtensionModuleFilter {
@@ -34,7 +38,7 @@ impl TryFrom<&str> for ExtensionModuleFilter {
             "minimal" => Ok(ExtensionModuleFilter::Minimal),
             "all" => Ok(ExtensionModuleFilter::All),
             "no-libraries" => Ok(ExtensionModuleFilter::NoLibraries),
-            "no-gpl" => Ok(ExtensionModuleFilter::NoGPL),
+            "no-copyleft" => Ok(ExtensionModuleFilter::NoCopyleft),
             t => Err(format!("{} is not a valid extension module filter", t)),
         }
     }
@@ -45,7 +49,7 @@ impl AsRef<str> for ExtensionModuleFilter {
         match self {
             ExtensionModuleFilter::All => "all",
             ExtensionModuleFilter::Minimal => "minimal",
-            ExtensionModuleFilter::NoGPL => "no-gpl",
+            ExtensionModuleFilter::NoCopyleft => "no-copyleft",
             ExtensionModuleFilter::NoLibraries => "no-libraries",
         }
     }
@@ -111,7 +115,7 @@ pub struct PythonPackagingPolicy {
 
     /// Whether untyped files are allowed.
     ///
-    /// If true, `FileData` instances can be added to the resource collector.
+    /// If true, `File` instances can be added to the resource collector.
     ///
     /// If false, resources must be strongly typed (`PythonModuleSource`,
     /// `PythonPackageResource`, etc).
@@ -242,12 +246,12 @@ impl PythonPackagingPolicy {
         self.resources_location_fallback = location;
     }
 
-    /// Whether to allow untyped `FileData` resources.
+    /// Whether to allow untyped `File` resources.
     pub fn allow_files(&self) -> bool {
         self.allow_files
     }
 
-    /// Set whether to allow untyped `FileData` resources.
+    /// Set whether to allow untyped `File` resources.
     pub fn set_allow_files(&mut self, value: bool) {
         self.allow_files = value;
     }
@@ -521,14 +525,16 @@ impl PythonPackagingPolicy {
 
             // Always add minimally required extension modules, because things don't
             // work if we don't do this.
-            let ext_variants =
-                PythonExtensionModuleVariants::from_iter(variants.iter().filter_map(|em| {
+            let ext_variants: PythonExtensionModuleVariants = variants
+                .iter()
+                .filter_map(|em| {
                     if em.is_minimally_required() {
                         Some(em.clone())
                     } else {
                         None
                     }
-                }));
+                })
+                .collect();
 
             if !ext_variants.is_empty() {
                 res.push(
@@ -551,15 +557,16 @@ impl PythonPackagingPolicy {
                 }
 
                 ExtensionModuleFilter::NoLibraries => {
-                    let ext_variants = PythonExtensionModuleVariants::from_iter(
-                        variants.iter().filter_map(|em| {
+                    let ext_variants: PythonExtensionModuleVariants = variants
+                        .iter()
+                        .filter_map(|em| {
                             if !em.requires_libraries() {
                                 Some(em.clone())
                             } else {
                                 None
                             }
-                        }),
-                    );
+                        })
+                        .collect();
 
                     if !ext_variants.is_empty() {
                         res.push(
@@ -570,36 +577,45 @@ impl PythonPackagingPolicy {
                     }
                 }
 
-                ExtensionModuleFilter::NoGPL => {
-                    let ext_variants = PythonExtensionModuleVariants::from_iter(
-                        variants.iter().filter_map(|em| {
-                            if em.link_libraries.is_empty() {
+                ExtensionModuleFilter::NoCopyleft => {
+                    let ext_variants: PythonExtensionModuleVariants = variants
+                        .iter()
+                        .filter_map(|em| {
+                            // As a special case, if all we link against are system libraries
+                            // that are known to be benign, allow that.
+                            let all_safe_system_libraries = em.link_libraries.iter().all(|link| {
+                                link.system && SAFE_SYSTEM_LIBRARIES.contains(&link.name.as_str())
+                            });
+
+                            if em.link_libraries.is_empty() || all_safe_system_libraries {
                                 Some(em.clone())
-                            // Public domain is always allowed.
-                            } else if em.license_public_domain == Some(true) {
-                                Some(em.clone())
-                            // Use explicit license list if one is defined.
-                            } else if let Some(ref licenses) = em.licenses {
-                                // We filter through an allow list because it is safer. (No new GPL
-                                // licenses can slip through.)
-                                if licenses.iter().all(|license| {
-                                    license
-                                        .licenses
-                                        .iter()
-                                        .all(|license| NON_GPL_LICENSES.contains(&license.as_str()))
-                                }) {
-                                    Some(em.clone())
-                                } else {
-                                    None
+                            } else if let Some(license) = &em.license {
+                                match license.license() {
+                                    LicenseFlavor::Spdx(expression) => {
+                                        let copyleft = expression.evaluate(|req| {
+                                            if let Some(id) = req.license.id() {
+                                                id.is_copyleft()
+                                            } else {
+                                                true
+                                            }
+                                        });
+
+                                        if !copyleft {
+                                            Some(em.clone())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    LicenseFlavor::OtherExpression(_) => None,
+                                    LicenseFlavor::PublicDomain => Some(em.clone()),
+                                    LicenseFlavor::None => None,
+                                    LicenseFlavor::Unknown(_) => None,
                                 }
                             } else {
-                                // In lack of evidence that it isn't GPL, assume GPL.
-                                // TODO consider improving logic here, like allowing known system
-                                // and framework libraries to be used.
                                 None
                             }
-                        }),
-                    );
+                        })
+                        .collect();
 
                     if !ext_variants.is_empty() {
                         res.push(
@@ -620,8 +636,8 @@ impl PythonPackagingPolicy {
 mod tests {
     use {
         super::*,
-        crate::resource::{DataLocation, FileData},
         std::path::PathBuf,
+        tugger_file_manifest::{File, FileEntry},
     };
 
     #[test]
@@ -629,10 +645,12 @@ mod tests {
         let mut policy = PythonPackagingPolicy::default();
         policy.include_file_resources = false;
 
-        let file = FileData {
+        let file = File {
             path: PathBuf::from("foo.py"),
-            is_executable: false,
-            data: DataLocation::Memory(vec![42]),
+            entry: FileEntry {
+                executable: false,
+                data: vec![42].into(),
+            },
         };
 
         let add_context = policy.derive_add_collection_context(&file.clone().into());

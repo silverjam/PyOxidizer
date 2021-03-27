@@ -1,6 +1,6 @@
 # PyOxidizer
 
-[![Build Status](https://dev.azure.com/gregoryszorc/PyOxidizer/_apis/build/status/indygreg.PyOxidizer?branchName=main)](https://dev.azure.com/gregoryszorc/PyOxidizer/_build/latest?definitionId=1&branchName=main)
+[![Build Status](https://github.com/indygreg/PyOxidizer/workflows/.github/workflows/pyoxidizer.yml/badge.svg)](https://github.com/indygreg/PyOxidizer/actions)
 
 `PyOxidizer` is a utility for producing binaries that embed Python.
 The over-arching goal of `PyOxidizer` is to make complex packaging and
@@ -56,4 +56,5 @@ at https://pyoxidizer.readthedocs.io/en/latest/index.html.
 mailing list is a forum for users to discuss all things PyOxidizer.
 
 :moneybag: If you want to financially contribute to PyOxidizer, do so
+via [GitHub Sponsors](https://github.com/sponsors/indygreg) or
 [on Patreon](https://www.patreon.com/indygreg).

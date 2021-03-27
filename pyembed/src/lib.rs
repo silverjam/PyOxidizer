@@ -39,10 +39,12 @@ interfacing.
 **It is an explicit goal of this crate to rely on as few external dependencies
 as possible.** This is because we want to minimize bloat in produced binaries.
 At this time, we have required direct dependencies on published versions of the
-`anyhow`, `lazy_static`, `libc`, `memmap`, `python-packed-resources`, and `uuid`
-crates. On Windows, this list is extended by `memory-module-sys` and `winapi`,
-which are required to support loading DLLs from memory. We also have an optional
-direct dependency on the `jemalloc-sys` crate.
+`anyhow`, `dunce`, `libc`, `memmap`, `once_cell`, `python-packed-resources`,
+`python-packaging`, `tugger-file-manifest`, and `uuid` crates. On Windows, this
+list is extended by `memory-module-sys` and `winapi`, which are required to
+support loading DLLs from memory. We also have an optional direct dependency
+on the `jemalloc-sys`, `libmimalloc-sys`, and `snmalloc-sys` crates for custom
+memory allocators.
 
 This crate requires linking against a library providing CPython C symbols.
 (This dependency is via the `python3-sys` crate.) On Windows, this library
@@ -55,6 +57,14 @@ The optional `jemalloc` feature controls support for using
 from Python is a run-time configuration option controlled by the
 `OxidizedPythonInterpreterConfig` type and having `jemalloc` compiled into the
 binary does not mean it is being used!
+
+The optional `mimalloc` feature controls support for using
+[mimalloc](https://github.com/microsoft/mimalloc) as Python's memory allocator.
+The feature behaves similarly to `jemalloc`, which is documented above.
+
+The optional `snmalloc` feature controls support for using
+[snmalloc](https://github.com/microsoft/snmalloc) as Python's memory allocator.
+The feature behaves similarly to `jemalloc`, which is documented above.
 
 There exist mutually exclusive `build-mode-*` features to control how the
 `build.rs` build script works.
@@ -83,9 +93,10 @@ That crate's build script will attempt to find a `libpython` from the
 
 */
 
-#[cfg(not(library_mode = "extension"))]
+#[allow(unused)]
 mod config;
 mod conversion;
+mod error;
 #[allow(clippy::transmute_ptr_to_ptr, clippy::zero_ptr)]
 mod importer;
 #[cfg(not(library_mode = "extension"))]
@@ -100,8 +111,6 @@ mod osutils;
 mod package_metadata;
 #[cfg(not(library_mode = "extension"))]
 mod pyalloc;
-#[cfg(not(library_mode = "extension"))]
-mod python_eval;
 #[allow(unused_variables, clippy::transmute_ptr_to_ptr, clippy::zero_ptr)]
 mod python_resource_collector;
 #[allow(clippy::transmute_ptr_to_ptr, clippy::zero_ptr)]
@@ -114,18 +123,13 @@ pub mod technotes;
 #[cfg(test)]
 mod test;
 
-#[cfg(not(library_mode = "extension"))]
-#[allow(unused_imports)]
-pub use crate::config::{ExtensionModule, OxidizedPythonInterpreterConfig};
+pub use crate::{config::PackedResourcesSource, error::NewInterpreterError};
 
 #[cfg(not(library_mode = "extension"))]
 #[allow(unused_imports)]
-pub use crate::interpreter::{MainPythonInterpreter, NewInterpreterError};
-
-#[cfg(not(library_mode = "extension"))]
-#[allow(unused_imports)]
-pub use crate::python_eval::{
-    run, run_and_handle_error, run_code, run_file, run_module_as_main, run_repl,
+pub use crate::{
+    config::{ExtensionModule, OxidizedPythonInterpreterConfig},
+    interpreter::MainPythonInterpreter,
 };
 
 #[cfg(library_mode = "extension")]
@@ -135,8 +139,8 @@ pub use crate::importer::PyInit_oxidized_importer;
 #[allow(unused_imports)]
 pub use python_packaging::{
     interpreter::{
-        Allocator, BytesWarning, CheckHashPYCsMode, CoerceCLocale, PythonInterpreterConfig,
-        PythonInterpreterProfile, PythonRawAllocator, PythonRunMode, TerminfoResolution,
+        Allocator, BytesWarning, CheckHashPycsMode, CoerceCLocale, MemoryAllocatorBackend,
+        PythonInterpreterConfig, PythonInterpreterProfile, TerminfoResolution,
     },
     resource::BytecodeOptimizationLevel,
 };

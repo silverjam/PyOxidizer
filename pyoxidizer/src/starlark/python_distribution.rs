@@ -4,12 +4,11 @@
 
 use {
     super::{
-        env::{get_context, EnvironmentContext},
-        python_executable::PythonExecutable,
+        env::{get_context, PyOxidizerEnvironmentContext},
+        python_executable::PythonExecutableValue,
         python_interpreter_config::PythonInterpreterConfigValue,
         python_packaging_policy::PythonPackagingPolicyValue,
         python_resource::{add_context_for_value, python_resource_to_value},
-        util::{optional_str_arg, optional_type_arg, required_str_arg},
     },
     crate::py_packaging::{
         distribution::BinaryLibpythonLinkMode,
@@ -36,6 +35,7 @@ use {
             starlark_signature_extraction, starlark_signatures,
         },
     },
+    starlark_dialect_build_targets::{optional_str_arg, optional_type_arg},
     std::{convert::TryFrom, sync::Arc},
 };
 
@@ -64,23 +64,25 @@ impl PythonDistributionValue {
         label: &str,
     ) -> Result<Arc<dyn PythonDistribution>, ValueError> {
         if self.distribution.is_none() {
-            let raw_context = get_context(type_values)?;
-            let context = raw_context
-                .downcast_mut::<EnvironmentContext>()?
+            let pyoxidizer_context_value = get_context(type_values)?;
+            let pyoxidizer_context = pyoxidizer_context_value
+                .downcast_mut::<PyOxidizerEnvironmentContext>()?
                 .ok_or(ValueError::IncorrectParameterType)?;
 
+            let dest_dir = pyoxidizer_context.python_distributions_path(type_values)?;
+
             self.distribution = Some(
-                context
+                pyoxidizer_context
                     .distribution_cache
                     .resolve_distribution(
-                        &context.logger,
+                        pyoxidizer_context.logger(),
                         &self.source,
-                        Some(&context.python_distributions_path),
+                        Some(&dest_dir),
                     )
                     .map_err(|e| {
                         ValueError::from(RuntimeError {
                             code: "PYOXIDIZER_BUILD",
-                            message: e.to_string(),
+                            message: format!("{:?}", e),
                             label: label.to_string(),
                         })
                     })?
@@ -110,22 +112,21 @@ impl PythonDistributionValue {
     /// default_python_distribution(flavor, build_target=None, python_version=None)
     fn default_python_distribution(
         type_values: &TypeValues,
-        flavor: &Value,
+        flavor: String,
         build_target: &Value,
         python_version: &Value,
     ) -> ValueResult {
-        let flavor = required_str_arg("flavor", flavor)?;
         let build_target = optional_str_arg("build_target", build_target)?;
         let python_version = optional_str_arg("python_version", &python_version)?;
 
-        let raw_context = get_context(type_values)?;
-        let context = raw_context
-            .downcast_ref::<EnvironmentContext>()
+        let pyoxidizer_context_value = get_context(type_values)?;
+        let pyoxidizer_context = pyoxidizer_context_value
+            .downcast_ref::<PyOxidizerEnvironmentContext>()
             .ok_or(ValueError::IncorrectParameterType)?;
 
         let build_target = match build_target {
             Some(t) => t,
-            None => context.build_target_triple.clone(),
+            None => pyoxidizer_context.build_target_triple.clone(),
         };
 
         let flavor = DistributionFlavor::try_from(flavor.as_str()).map_err(|e| {
@@ -145,7 +146,7 @@ impl PythonDistributionValue {
             .map_err(|e| {
                 ValueError::from(RuntimeError {
                     code: "PYOXIDIZER_BUILD",
-                    message: e.to_string(),
+                    message: format!("{:?}", e),
                     label: "default_python_distribution()".to_string(),
                 })
             })?;
@@ -154,11 +155,9 @@ impl PythonDistributionValue {
     }
 
     /// PythonDistribution()
-    fn from_args(sha256: &Value, local_path: &Value, url: &Value, flavor: &Value) -> ValueResult {
-        required_str_arg("sha256", sha256)?;
+    fn from_args(sha256: String, local_path: &Value, url: &Value, flavor: String) -> ValueResult {
         optional_str_arg("local_path", local_path)?;
         optional_str_arg("url", url)?;
-        let flavor = required_str_arg("flavor", flavor)?;
 
         if local_path.get_type() != "NoneType" && url.get_type() != "NoneType" {
             return Err(ValueError::from(RuntimeError {
@@ -171,12 +170,12 @@ impl PythonDistributionValue {
         let distribution = if local_path.get_type() != "NoneType" {
             PythonDistributionLocation::Local {
                 local_path: local_path.to_string(),
-                sha256: sha256.to_string(),
+                sha256,
             }
         } else {
             PythonDistributionLocation::Url {
                 url: url.to_string(),
-                sha256: sha256.to_string(),
+                sha256,
             }
         };
 
@@ -203,7 +202,7 @@ impl PythonDistributionValue {
         let policy = dist.create_packaging_policy().map_err(|e| {
             ValueError::from(RuntimeError {
                 code: "PYOXIDIZER_BUILD",
-                message: e.to_string(),
+                message: format!("{:?}", e),
                 label: "make_python_packaging_policy()".to_string(),
             })
         })?;
@@ -218,7 +217,7 @@ impl PythonDistributionValue {
         let config = dist.create_python_interpreter_config().map_err(|e| {
             ValueError::from(RuntimeError {
                 code: "PYOXIDIZER_BUILD",
-                message: e.to_string(),
+                message: format!("{:?}", e),
                 label: "make_python_packaging_policy()".to_string(),
             })
         })?;
@@ -240,11 +239,10 @@ impl PythonDistributionValue {
         &mut self,
         type_values: &TypeValues,
         call_stack: &mut CallStack,
-        name: &Value,
+        name: String,
         packaging_policy: &Value,
         config: &Value,
     ) -> ValueResult {
-        let name = required_str_arg("name", &name)?;
         optional_type_arg(
             "packaging_policy",
             "PythonPackagingPolicy",
@@ -259,7 +257,7 @@ impl PythonDistributionValue {
                 dist.create_packaging_policy().map_err(|e| {
                     ValueError::from(RuntimeError {
                         code: "PYOXIDIZER_BUILD",
-                        message: e.to_string(),
+                        message: format!("{:?}", e),
                         label: "to_python_executable_starlark()".to_string(),
                     })
                 })?,
@@ -276,7 +274,7 @@ impl PythonDistributionValue {
                 dist.create_python_interpreter_config().map_err(|e| {
                     ValueError::from(RuntimeError {
                         code: "PYOXIDIZER_BUILD",
-                        message: e.to_string(),
+                        message: format!("{:?}", e),
                         label: "to_python_executable_starlark()".to_string(),
                     })
                 })?,
@@ -288,21 +286,24 @@ impl PythonDistributionValue {
             }
         }?;
 
-        let raw_context = get_context(type_values)?;
-        let context = raw_context
-            .downcast_ref::<EnvironmentContext>()
+        let pyoxidizer_context_value = get_context(type_values)?;
+        let pyoxidizer_context = pyoxidizer_context_value
+            .downcast_ref::<PyOxidizerEnvironmentContext>()
             .ok_or(ValueError::IncorrectParameterType)?;
+
+        let python_distributions_path =
+            pyoxidizer_context.python_distributions_path(type_values)?;
 
         let host_distribution = if dist
             .compatible_host_triples()
-            .contains(&context.build_host_triple)
+            .contains(&pyoxidizer_context.build_host_triple)
         {
             Some(dist.clone())
         } else {
             let flavor = DistributionFlavor::Standalone;
             let location = default_distribution_location(
                 &flavor,
-                &context.build_host_triple,
+                &pyoxidizer_context.build_host_triple,
                 Some(dist.python_major_minor_version().as_str()),
             )
             .map_err(|e| {
@@ -314,12 +315,12 @@ impl PythonDistributionValue {
             })?;
 
             Some(
-                context
+                pyoxidizer_context
                     .distribution_cache
                     .resolve_distribution(
-                        &context.logger,
+                        pyoxidizer_context.logger(),
                         &location,
-                        Some(&context.python_distributions_path),
+                        Some(&python_distributions_path),
                     )
                     .map_err(|e| {
                         ValueError::from(RuntimeError {
@@ -334,9 +335,9 @@ impl PythonDistributionValue {
 
         let mut builder = dist
             .as_python_executable_builder(
-                &context.logger,
-                &context.build_host_triple,
-                &context.build_target_triple,
+                pyoxidizer_context.logger(),
+                &pyoxidizer_context.build_host_triple,
+                &pyoxidizer_context.build_target_triple,
                 &name,
                 // TODO make configurable
                 BinaryLibpythonLinkMode::Default,
@@ -347,7 +348,7 @@ impl PythonDistributionValue {
             .map_err(|e| {
                 ValueError::from(RuntimeError {
                     code: "PYOXIDIZER_BUILD",
-                    message: e.to_string(),
+                    message: format!("{:?}", e),
                     label: "to_python_executable()".to_string(),
                 })
             })?;
@@ -387,12 +388,12 @@ impl PythonDistributionValue {
             .map_err(|e| {
                 ValueError::from(RuntimeError {
                     code: "PYOXIDIZER_BUILD",
-                    message: e.to_string(),
+                    message: format!("{:?}", e),
                     label: "to_python_executable()".to_string(),
                 })
             })?;
 
-        Ok(Value::new(PythonExecutable::new(builder, policy)))
+        Ok(Value::new(PythonExecutableValue::new(builder, policy)))
     }
 
     pub fn python_resources_starlark(
@@ -405,7 +406,7 @@ impl PythonDistributionValue {
             PythonPackagingPolicyValue::new(dist.create_packaging_policy().map_err(|e| {
                 ValueError::from(RuntimeError {
                     code: "PYOXIDIZER_BUILD",
-                    message: e.to_string(),
+                    message: format!("{:?}", e),
                     label: "python_resources()".to_string(),
                 })
             })?);
@@ -422,29 +423,23 @@ impl PythonDistributionValue {
 
 starlark_module! { python_distribution_module =>
     #[allow(non_snake_case, clippy::ptr_arg)]
-    PythonDistribution(sha256, local_path=NoneType::None, url=NoneType::None, flavor="standalone") {
-        PythonDistributionValue::from_args(&sha256, &local_path, &url, &flavor)
+    PythonDistribution(sha256: String, local_path=NoneType::None, url=NoneType::None, flavor: String = "standalone".to_string()) {
+        PythonDistributionValue::from_args(sha256, &local_path, &url, flavor)
     }
 
     PythonDistribution.make_python_packaging_policy(env env, this) {
-        match this.clone().downcast_mut::<PythonDistributionValue>()? {
-            Some(mut dist) => dist.make_python_packaging_policy_starlark(&env),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+        let mut this = this.downcast_mut::<PythonDistributionValue>().unwrap().unwrap();
+        this.make_python_packaging_policy_starlark(&env)
     }
 
     PythonDistribution.make_python_interpreter_config(env env, this) {
-        match this.clone().downcast_mut::<PythonDistributionValue>()? {
-            Some(mut dist) => dist.make_python_interpreter_config_starlark(&env),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+        let mut this = this.downcast_mut::<PythonDistributionValue>().unwrap().unwrap();
+        this.make_python_interpreter_config_starlark(&env)
     }
 
     PythonDistribution.python_resources(env env, call_stack cs, this) {
-        match this.clone().downcast_mut::<PythonDistributionValue>()? {
-            Some(mut dist) => dist.python_resources_starlark(&env, cs),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+        let mut this = this.downcast_mut::<PythonDistributionValue>().unwrap().unwrap();
+        this.python_resources_starlark(&env, cs)
     }
 
     #[allow(non_snake_case, clippy::ptr_arg)]
@@ -452,30 +447,28 @@ starlark_module! { python_distribution_module =>
         env env,
         call_stack cs,
         this,
-        name,
+        name: String,
         packaging_policy=NoneType::None,
         config=NoneType::None
     ) {
-        match this.clone().downcast_mut::<PythonDistributionValue>()? {
-            Some(mut dist) =>dist.to_python_executable_starlark(
-                &env,
-                cs,
-                &name,
-                &packaging_policy,
-                &config,
-            ),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+        let mut this = this.downcast_mut::<PythonDistributionValue>().unwrap().unwrap();
+        this.to_python_executable_starlark(
+            &env,
+            cs,
+            name,
+            &packaging_policy,
+            &config,
+        )
     }
 
     #[allow(clippy::ptr_arg)]
     default_python_distribution(
         env env,
-        flavor="standalone",
+        flavor: String = "standalone".to_string(),
         build_target=NoneType::None,
         python_version=NoneType::None
     ) {
-        PythonDistributionValue::default_python_distribution(&env, &flavor, &build_target, &python_version)
+        PythonDistributionValue::default_python_distribution(&env, flavor, &build_target, &python_version)
     }
 }
 
@@ -509,17 +502,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_python_distribution_bad_arg() {
-        let err = starlark_nok("default_python_distribution(False)");
-        assert_eq!(
-            err.message,
-            "function expects a string for flavor; got type bool"
-        );
-    }
-
-    #[test]
+    // Python 3.8 not supported on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_default_python_distribution_python_38() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         let dist = env.eval("default_python_distribution(python_version='3.8')")?;
         assert_eq!(dist.get_type(), "PythonDistribution");
@@ -540,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_default_python_distribution_python_39() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         let dist = env.eval("default_python_distribution(python_version='3.9')")?;
         assert_eq!(dist.get_type(), "PythonDistribution");

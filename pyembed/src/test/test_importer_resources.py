@@ -5,7 +5,6 @@
 import importlib.machinery
 import marshal
 import pathlib
-import sys
 import unittest
 
 from oxidized_importer import (
@@ -17,6 +16,7 @@ from oxidized_importer import (
 class TestImporterResources(unittest.TestCase):
     def test_resources_builtins(self):
         f = OxidizedFinder()
+        f.index_interpreter_builtin_extension_modules()
         resources = f.indexed_resources()
         self.assertIsInstance(resources, list)
         self.assertGreater(len(resources), 0)
@@ -58,6 +58,7 @@ class TestImporterResources(unittest.TestCase):
 
     def test_resources_frozen(self):
         f = OxidizedFinder()
+        f.index_interpreter_frozen_modules()
         resources = f.indexed_resources()
 
         resource = [x for x in resources if x.name == "_frozen_importlib"][0]
@@ -653,7 +654,8 @@ class TestImporterResources(unittest.TestCase):
         serialized = f.serialize_indexed_resources()
         self.assertIsInstance(serialized, bytes)
 
-        f2 = OxidizedFinder(resources_data=serialized)
+        f2 = OxidizedFinder()
+        f2.index_bytes(serialized)
 
         modules = {r.name: r for r in f2.indexed_resources() if r.is_module}
         self.assertEqual(len(modules), 2)
@@ -666,4 +668,4 @@ class TestImporterResources(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(exit=False)
+    unittest.main()

@@ -4,52 +4,53 @@
 
 //! Handle file layout of PyOxidizer projects.
 
-use anyhow::{anyhow, Result};
-use handlebars::Handlebars;
-use lazy_static::lazy_static;
-use python_packaging::filesystem_scanning::walk_tree_files;
-use serde::Serialize;
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use {
+    crate::environment::{PyOxidizerSource, BUILD_GIT_COMMIT, PYOXIDIZER_VERSION},
+    anyhow::{anyhow, Result},
+    handlebars::Handlebars,
+    once_cell::sync::Lazy,
+    python_packaging::filesystem_scanning::walk_tree_files,
+    serde::Serialize,
+    std::{
+        collections::BTreeMap,
+        io::Write,
+        path::{Path, PathBuf},
+    },
+};
 
-use crate::environment::{PyOxidizerSource, BUILD_GIT_COMMIT, PYOXIDIZER_VERSION};
+static HANDLEBARS: Lazy<Handlebars<'static>> = Lazy::new(|| {
+    let mut handlebars = Handlebars::new();
 
-lazy_static! {
-    static ref HANDLEBARS: Handlebars<'static> = {
-        let mut handlebars = Handlebars::new();
+    handlebars
+        .register_template_string(
+            "application-manifest.rc",
+            include_str!("templates/application-manifest.rc.hbs"),
+        )
+        .unwrap();
+    handlebars
+        .register_template_string("exe.manifest", include_str!("templates/exe.manifest.hbs"))
+        .unwrap();
+    handlebars
+        .register_template_string("new-build.rs", include_str!("templates/new-build.rs.hbs"))
+        .unwrap();
+    handlebars
+        .register_template_string(
+            "new-cargo-config",
+            include_str!("templates/new-cargo-config.hbs"),
+        )
+        .unwrap();
+    handlebars
+        .register_template_string("new-main.rs", include_str!("templates/new-main.rs.hbs"))
+        .unwrap();
+    handlebars
+        .register_template_string(
+            "new-pyoxidizer.bzl",
+            include_str!("templates/new-pyoxidizer.bzl.hbs"),
+        )
+        .unwrap();
 
-        handlebars
-            .register_template_string(
-                "application-manifest.rc",
-                include_str!("templates/application-manifest.rc"),
-            )
-            .unwrap();
-        handlebars
-            .register_template_string("exe.manifest", include_str!("templates/exe.manifest"))
-            .unwrap();
-        handlebars
-            .register_template_string("new-build.rs", include_str!("templates/new-build.rs"))
-            .unwrap();
-        handlebars
-            .register_template_string(
-                "new-cargo-config",
-                include_str!("templates/new-cargo-config"),
-            )
-            .unwrap();
-        handlebars
-            .register_template_string("new-main.rs", include_str!("templates/new-main.rs"))
-            .unwrap();
-        handlebars
-            .register_template_string(
-                "new-pyoxidizer.bzl",
-                include_str!("templates/new-pyoxidizer.bzl"),
-            )
-            .unwrap();
-
-        handlebars
-    };
-}
+    handlebars
+});
 
 #[derive(Serialize)]
 struct PythonDistribution {
@@ -94,7 +95,11 @@ fn populate_template_data(data: &mut TemplateData) {
     let env = super::environment::resolve_environment().unwrap();
 
     data.pyoxidizer_version = Some(PYOXIDIZER_VERSION.to_string());
-    data.pyoxidizer_commit = Some(BUILD_GIT_COMMIT.to_string());
+    data.pyoxidizer_commit = Some(
+        BUILD_GIT_COMMIT
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+    );
 
     match env.pyoxidizer_source {
         PyOxidizerSource::LocalPath { path } => {
@@ -159,8 +164,14 @@ pub fn write_new_build_rs(path: &Path, program_name: &str) -> Result<()> {
 }
 
 /// Write a new main.rs file that runs the embedded Python interpreter.
-pub fn write_new_main_rs(path: &Path) -> Result<()> {
-    let data: BTreeMap<String, String> = BTreeMap::new();
+///
+/// `windows_subsystem` is the value of the `windows_subsystem` Rust attribute.
+pub fn write_new_main_rs(path: &Path, windows_subsystem: &str) -> Result<()> {
+    let mut data: BTreeMap<String, String> = BTreeMap::new();
+    data.insert(
+        "windows_subsystem".to_string(),
+        windows_subsystem.to_string(),
+    );
     let t = HANDLEBARS.render("new-main.rs", &data)?;
 
     println!("writing {}", path.to_str().unwrap());
@@ -311,21 +322,47 @@ pub fn update_new_cargo_toml(path: &Path, pyembed_location: &PyembedLocation) ->
     content.push_str("build = \"build.rs\"\n");
     content.push_str(after);
 
-    content.push_str("jemallocator-global = { git = \"https://github.com/silverjam/jemallocator.git\", optional = true }\n");
-
     content.push_str(&format!(
         "pyembed = {{ {}, default-features = false }}\n",
         pyembed_location.cargo_manifest_fields()
     ));
+    content.push('\n');
 
-    content.push_str("\n");
+    /*
+    content.push_str("[dependencies.jemallocator]\n");
+    content.push_str("version = \"0.3\"\n");
+    content.push_str("optional = true\n");
+    content.push('\n');
+    */
+    // @silverjam: New location
+    content.push_str("jemallocator = { git = \"https://github.com/silverjam/jemallocator.git\", optional = true }\n");
+
+    content.push_str("[dependencies.mimalloc]\n");
+    content.push_str("version = \"0.1\"\n");
+    content.push_str("optional = true\n");
+    content.push_str("features = [\"local_dynamic_tls\", \"override\", \"secure\"]\n");
+    content.push('\n');
+
+    content.push_str("[dependencies.snmalloc-rs]\n");
+    content.push_str("version = \"0.2\"\n");
+    content.push_str("optional = true\n");
+    content.push('\n');
+
     content.push_str("[build-dependencies]\n");
     content.push_str("embed-resource = \"1.3\"\n");
 
-    content.push_str("\n");
+    content.push('\n');
     content.push_str("[features]\n");
     content.push_str("default = [\"build-mode-pyoxidizer-exe\"]\n");
-    content.push_str("jemalloc = [\"jemallocator-global\", \"pyembed/jemalloc\"]\n");
+    content.push('\n');
+    content.push_str("global-allocator-jemalloc = [\"jemallocator\"]\n");
+    content.push_str("global-allocator-mimalloc = [\"mimalloc\"]\n");
+    content.push_str("global-allocator-snmalloc = [\"snmalloc-rs\"]\n");
+    content.push('\n');
+    content.push_str("allocator-jemalloc = [\"pyembed/jemalloc\"]\n");
+    content.push_str("allocator-mimalloc = [\"pyembed/mimalloc\"]\n");
+    content.push_str("allocator-snmalloc = [\"pyembed/snmalloc\"]\n");
+    content.push('\n');
     content.push_str("build-mode-pyoxidizer-exe = [\"pyembed/build-mode-pyoxidizer-exe\"]\n");
     content
         .push_str("build-mode-prebuilt-artifacts = [\"pyembed/build-mode-prebuilt-artifacts\"]\n");
@@ -343,11 +380,15 @@ pub fn update_new_cargo_toml(path: &Path, pyembed_location: &PyembedLocation) ->
 ///
 /// The created binary application will have the name of the final
 /// path component.
+///
+/// `windows_subsystem` is the value of the `windows_subsystem` compiler
+/// attribute.
 pub fn initialize_project(
     project_path: &Path,
     pyembed_location: &PyembedLocation,
     code: Option<&str>,
     pip_install: &[&str],
+    windows_subsystem: &str,
 ) -> Result<()> {
     let status = std::process::Command::new("cargo")
         .arg("init")
@@ -365,7 +406,7 @@ pub fn initialize_project(
     update_new_cargo_toml(&path.join("Cargo.toml"), pyembed_location)?;
     write_new_cargo_config(&path)?;
     write_new_build_rs(&path.join("build.rs"), name)?;
-    write_new_main_rs(&path.join("src").join("main.rs"))?;
+    write_new_main_rs(&path.join("src").join("main.rs"), windows_subsystem)?;
     write_new_pyoxidizer_config_file(&path, &name, code, pip_install)?;
     write_application_manifest(&path, &name)?;
 

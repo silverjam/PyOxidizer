@@ -4,6 +4,7 @@
 
 import importlib.machinery
 import importlib.util
+import importlib
 import marshal
 import os
 import pathlib
@@ -24,8 +25,10 @@ class TestImporterModuleLoading(unittest.TestCase):
             prefix="oxidized_importer-test-"
         )
         self.td = pathlib.Path(self.raw_temp_dir.name)
+        self.old_meta_path = list(sys.meta_path)
 
     def tearDown(self):
+        sys.meta_path[:] = self.old_meta_path
         self.raw_temp_dir.cleanup()
         del self.raw_temp_dir
         del self.td
@@ -48,7 +51,9 @@ class TestImporterModuleLoading(unittest.TestCase):
             collector.add_in_memory(r)
 
         f = OxidizedFinder()
-        f.add_resources(collector.oxidize()[0])
+        f.add_resources(
+            collector.oxidize(python_exe=os.environ.get("PYTHON_SYS_EXECUTABLE"))[0]
+        )
 
         return f
 
@@ -73,7 +78,8 @@ class TestImporterModuleLoading(unittest.TestCase):
         self.assertIsNone(spec.loader_state)
         self.assertIsInstance(spec.submodule_search_locations, list)
         self.assertEqual(
-            spec.submodule_search_locations, [os.path.join(sys.argv[0], "my_package")],
+            spec.submodule_search_locations,
+            [os.path.join(sys.argv[0], "my_package")],
         )
 
         # Default module creation semantics for source modules.
@@ -121,7 +127,8 @@ class TestImporterModuleLoading(unittest.TestCase):
         self.assertIsNone(spec.loader_state)
         self.assertIsInstance(spec.submodule_search_locations, list)
         self.assertEqual(
-            spec.submodule_search_locations, [os.path.join(sys.argv[0], "my_package")],
+            spec.submodule_search_locations,
+            [os.path.join(sys.argv[0], "my_package")],
         )
 
         # Default module creation semantics for bytecode modules.
@@ -143,6 +150,40 @@ class TestImporterModuleLoading(unittest.TestCase):
         with self.assertRaises(ImportError):
             f.get_filename("my_package")
 
+    def test_dot_init(self):
+        p = self._make_package("dotinit")
+
+        with (p / "__init__.py").open("wb") as fh:
+            fh.write(b"test = True\n")
+
+        with (p / "bar.py").open("wb") as fh:
+            fh.write(b"from .__init__ import test\n")
+
+        f = self._finder_from_td()
+
+        spec = f.find_spec("dotinit.bar", None)
+        self.assertIsInstance(spec, importlib.machinery.ModuleSpec)
+        self.assertEqual(spec.name, "dotinit.bar")
+        self.assertIsInstance(spec.loader, OxidizedFinder)
+
+        spec = f.find_spec("dotinit.__init__", None)
+        self.assertIsInstance(spec, importlib.machinery.ModuleSpec)
+        self.assertEqual(spec.name, "dotinit")
+        self.assertIsInstance(spec.loader, OxidizedFinder)
+        self.assertEqual(spec.parent, "dotinit")
+
+        sys.meta_path.insert(0, f)
+
+        self.assertNotIn("dotinit", sys.modules)
+        self.assertNotIn("dotinit.bar", sys.modules)
+        self.assertNotIn("dotinit.__init__", sys.modules)
+
+        importlib.import_module("dotinit.bar")
+
+        self.assertIn("dotinit", sys.modules)
+        self.assertIn("dotinit.bar", sys.modules)
+        self.assertNotIn("dotinit.__init__", sys.modules)
+
 
 if __name__ == "__main__":
-    unittest.main(exit=False)
+    unittest.main()

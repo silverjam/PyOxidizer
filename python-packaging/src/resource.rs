@@ -7,11 +7,10 @@
 use {
     crate::{
         bytecode::{CompileMode, PythonBytecodeCompiler},
-        licensing::LicenseInfo,
         module_util::{is_package_from_path, packages_from_module_name, resolve_path_for_module},
         python_source::has_dunder_file,
     },
-    anyhow::{anyhow, Context, Result},
+    anyhow::{anyhow, Result},
     std::{
         borrow::Cow,
         collections::HashMap,
@@ -20,31 +19,9 @@ use {
         iter::FromIterator,
         path::{Path, PathBuf},
     },
+    tugger_file_manifest::{File, FileData},
+    tugger_licensing::LicensedComponent,
 };
-
-/// Represents an abstract location for binary data.
-///
-/// Data can be backed by memory or by a path in the filesystem.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DataLocation {
-    Path(PathBuf),
-    Memory(Vec<u8>),
-}
-
-impl DataLocation {
-    /// Resolve the raw content of this instance.
-    pub fn resolve(&self) -> Result<Vec<u8>> {
-        match self {
-            DataLocation::Path(p) => std::fs::read(p).context(format!("reading {}", p.display())),
-            DataLocation::Memory(data) => Ok(data.clone()),
-        }
-    }
-
-    /// Resolve the instance to a Memory variant.
-    pub fn to_memory(&self) -> Result<DataLocation> {
-        Ok(DataLocation::Memory(self.resolve()?))
-    }
-}
 
 /// An optimization level for Python bytecode.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,12 +71,12 @@ pub struct PythonModuleSource {
     /// The fully qualified Python module name.
     pub name: String,
     /// Python source code.
-    pub source: DataLocation,
+    pub source: FileData,
     /// Whether this module is also a package.
     pub is_package: bool,
     /// Tag to apply to bytecode files.
     ///
-    /// e.g. `cpython-37`.
+    /// e.g. `cpython-39`.
     pub cache_tag: String,
     /// Whether this module belongs to the Python standard library.
     ///
@@ -137,6 +114,15 @@ impl PythonModuleSource {
         }
     }
 
+    /// Obtain the top-level package name this module belongs to.
+    pub fn top_level_package(&self) -> &str {
+        if let Some(idx) = self.name.find('.') {
+            &self.name[0..idx]
+        } else {
+            &self.name
+        }
+    }
+
     /// Convert the instance to a BytecodeModule.
     pub fn as_bytecode_module(
         &self,
@@ -171,12 +157,12 @@ impl PythonModuleSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PythonModuleBytecodeFromSource {
     pub name: String,
-    pub source: DataLocation,
+    pub source: FileData,
     pub optimize_level: BytecodeOptimizationLevel,
     pub is_package: bool,
     /// Tag to apply to bytecode files.
     ///
-    /// e.g. `cpython-37`.
+    /// e.g. `cpython-39`.
     pub cache_tag: String,
     /// Whether this module belongs to the Python standard library.
     ///
@@ -237,12 +223,12 @@ impl PythonModuleBytecodeFromSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PythonModuleBytecode {
     pub name: String,
-    bytecode: DataLocation,
+    bytecode: FileData,
     pub optimize_level: BytecodeOptimizationLevel,
     pub is_package: bool,
     /// Tag to apply to bytecode files.
     ///
-    /// e.g. `cpython-37`.
+    /// e.g. `cpython-39`.
     pub cache_tag: String,
     /// Whether this module belongs to the Python standard library.
     ///
@@ -265,7 +251,7 @@ impl PythonModuleBytecode {
     ) -> Self {
         Self {
             name: name.to_string(),
-            bytecode: DataLocation::Memory(data.to_vec()),
+            bytecode: FileData::Memory(data.to_vec()),
             optimize_level,
             is_package,
             cache_tag: cache_tag.to_string(),
@@ -282,7 +268,7 @@ impl PythonModuleBytecode {
     ) -> Self {
         Self {
             name: name.to_string(),
-            bytecode: DataLocation::Path(path.to_path_buf()),
+            bytecode: FileData::Path(path.to_path_buf()),
             optimize_level,
             is_package: is_package_from_path(path),
             cache_tag: cache_tag.to_string(),
@@ -294,7 +280,7 @@ impl PythonModuleBytecode {
     pub fn to_memory(&self) -> Result<Self> {
         Ok(Self {
             name: self.name.clone(),
-            bytecode: DataLocation::Memory(self.resolve_bytecode()?),
+            bytecode: FileData::Memory(self.resolve_bytecode()?),
             optimize_level: self.optimize_level,
             is_package: self.is_package,
             cache_tag: self.cache_tag.clone(),
@@ -306,8 +292,8 @@ impl PythonModuleBytecode {
     /// Resolve the bytecode data for this module.
     pub fn resolve_bytecode(&self) -> Result<Vec<u8>> {
         match &self.bytecode {
-            DataLocation::Memory(data) => Ok(data.clone()),
-            DataLocation::Path(path) => {
+            FileData::Memory(data) => Ok(data.clone()),
+            FileData::Path(path) => {
                 let data = std::fs::read(path)?;
 
                 if data.len() >= 16 {
@@ -321,7 +307,7 @@ impl PythonModuleBytecode {
 
     /// Sets the bytecode for this module.
     pub fn set_bytecode(&mut self, data: &[u8]) {
-        self.bytecode = DataLocation::Memory(data.to_vec());
+        self.bytecode = FileData::Memory(data.to_vec());
     }
 
     /// Resolve filesystem path to this bytecode.
@@ -344,7 +330,7 @@ pub struct PythonPackageResource {
     /// The relative path within `leaf_package` to this resource.
     pub relative_name: String,
     /// Location of resource data.
-    pub data: DataLocation,
+    pub data: FileData,
     /// Whether this resource belongs to the Python standard library.
     ///
     /// Modules with this set are distributed as part of Python itself.
@@ -417,7 +403,7 @@ pub struct PythonPackageDistributionResource {
     pub name: String,
 
     /// The raw content of the distribution resource.
-    pub data: DataLocation,
+    pub data: FileData,
 }
 
 impl PythonPackageDistributionResource {
@@ -458,13 +444,13 @@ pub struct LibraryDependency {
     pub name: String,
 
     /// Static library version of library.
-    pub static_library: Option<DataLocation>,
+    pub static_library: Option<FileData>,
 
     /// The filename the static library should be materialized as.
     pub static_filename: Option<PathBuf>,
 
     /// Shared library version of library.
-    pub dynamic_library: Option<DataLocation>,
+    pub dynamic_library: Option<FileData>,
 
     /// The filename the dynamic library should be materialized as.
     pub dynamic_filename: Option<PathBuf>,
@@ -507,7 +493,7 @@ pub struct SharedLibrary {
     pub name: String,
 
     /// Holds the raw content of the shared library.
-    pub data: DataLocation,
+    pub data: FileData,
 
     /// The filename the library should be materialized as.
     pub filename: Option<PathBuf>,
@@ -539,10 +525,10 @@ pub struct PythonExtensionModule {
     /// Filename suffix to use when writing extension module data.
     pub extension_file_suffix: String,
     /// File data for linked extension module.
-    pub shared_library: Option<DataLocation>,
+    pub shared_library: Option<FileData>,
     // TODO capture static library?
     /// File data for object files linked together to produce this extension module.
-    pub object_file_data: Vec<DataLocation>,
+    pub object_file_data: Vec<FileData>,
     /// Whether this extension module is a package.
     pub is_package: bool,
     /// Libraries that this extension depends on.
@@ -564,9 +550,7 @@ pub struct PythonExtensionModule {
     /// available to choose from.
     pub variant: Option<String>,
     /// Licenses that apply to this extension.
-    pub licenses: Option<Vec<LicenseInfo>>,
-    /// Whether the license for this extension and any library dependencies are in the public domain.
-    pub license_public_domain: Option<bool>,
+    pub license: Option<LicensedComponent>,
 }
 
 impl PythonExtensionModule {
@@ -591,8 +575,7 @@ impl PythonExtensionModule {
             builtin_default: self.builtin_default,
             required: self.required,
             variant: self.variant.clone(),
-            licenses: self.licenses.clone(),
-            license_public_domain: self.license_public_domain,
+            license: self.license.clone(),
         })
     }
 
@@ -646,6 +629,15 @@ impl PythonExtensionModule {
     /// shared library extension module is available.
     pub fn in_libpython(&self) -> bool {
         self.is_stdlib && (self.builtin_default || self.shared_library.is_none())
+    }
+
+    /// Obtain the top-level package name this module belongs to.
+    pub fn top_level_package(&self) -> &str {
+        if let Some(idx) = self.name.find('.') {
+            &self.name[0..idx]
+        } else {
+            &self.name
+        }
     }
 }
 
@@ -715,7 +707,7 @@ impl PythonExtensionModuleVariants {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PythonEggFile {
     /// Content of the .egg file.
-    pub data: DataLocation,
+    pub data: FileData,
 }
 
 impl PythonEggFile {
@@ -732,7 +724,7 @@ impl PythonEggFile {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PythonPathExtension {
     /// Content of the .pth file.
-    pub data: DataLocation,
+    pub data: FileData,
 }
 
 impl PythonPathExtension {
@@ -743,37 +735,8 @@ impl PythonPathExtension {
     }
 }
 
-/// Represents an arbitrary, unclassified file.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileData {
-    /// The path of the file being tracked.
-    ///
-    /// Can be relative or absolute.
-    pub path: PathBuf,
-
-    /// Whether the file should have the execute bit set.
-    pub is_executable: bool,
-
-    /// The data in the file.
-    pub data: DataLocation,
-}
-
-impl FileData {
-    /// Convert the path to a String.
-    pub fn path_string(&self) -> String {
-        self.path.to_string_lossy().to_string()
-    }
-
-    pub fn to_memory(&self) -> Result<Self> {
-        Ok(Self {
-            path: self.path.clone(),
-            is_executable: self.is_executable,
-            data: self.data.to_memory()?,
-        })
-    }
-}
-
 /// Represents a resource that can be read by Python somehow.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum PythonResource<'a> {
     /// A module defined by source code.
@@ -793,7 +756,7 @@ pub enum PythonResource<'a> {
     /// A path extension.
     PathExtension(Cow<'a, PythonPathExtension>),
     /// An arbitrary file and its data.
-    File(Cow<'a, FileData>),
+    File(Cow<'a, File>),
 }
 
 impl<'a> PythonResource<'a> {
@@ -954,14 +917,14 @@ impl<'a> From<&'a PythonPathExtension> for PythonResource<'a> {
     }
 }
 
-impl<'a> From<FileData> for PythonResource<'a> {
-    fn from(f: FileData) -> Self {
+impl<'a> From<File> for PythonResource<'a> {
+    fn from(f: File) -> Self {
         PythonResource::File(Cow::Owned(f))
     }
 }
 
-impl<'a> From<&'a FileData> for PythonResource<'a> {
-    fn from(f: &'a FileData) -> Self {
+impl<'a> From<&'a File> for PythonResource<'a> {
+    fn from(f: &'a File) -> Self {
         PythonResource::File(Cow::Borrowed(f))
     }
 }
@@ -970,13 +933,13 @@ impl<'a> From<&'a FileData> for PythonResource<'a> {
 mod tests {
     use super::*;
 
-    const DEFAULT_CACHE_TAG: &str = "cpython-37";
+    const DEFAULT_CACHE_TAG: &str = "cpython-39";
 
     #[test]
     fn test_is_in_packages() {
         let source = PythonResource::ModuleSource(Cow::Owned(PythonModuleSource {
             name: "foo".to_string(),
-            source: DataLocation::Memory(vec![]),
+            source: FileData::Memory(vec![]),
             is_package: false,
             cache_tag: DEFAULT_CACHE_TAG.to_string(),
             is_stdlib: false,
@@ -988,7 +951,7 @@ mod tests {
 
         let bytecode = PythonResource::ModuleBytecode(Cow::Owned(PythonModuleBytecode {
             name: "foo".to_string(),
-            bytecode: DataLocation::Memory(vec![]),
+            bytecode: FileData::Memory(vec![]),
             optimize_level: BytecodeOptimizationLevel::Zero,
             is_package: false,
             cache_tag: DEFAULT_CACHE_TAG.to_string(),

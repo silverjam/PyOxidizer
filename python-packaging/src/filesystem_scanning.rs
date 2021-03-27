@@ -11,19 +11,19 @@ use {
         module_util::{is_package_from_path, PythonModuleSuffixes},
         package_metadata::PythonPackageMetadata,
         resource::{
-            BytecodeOptimizationLevel, DataLocation, FileData, PythonEggFile,
-            PythonExtensionModule, PythonModuleBytecode, PythonModuleSource,
-            PythonPackageDistributionResource, PythonPackageDistributionResourceFlavor,
-            PythonPackageResource, PythonPathExtension, PythonResource,
+            BytecodeOptimizationLevel, PythonEggFile, PythonExtensionModule, PythonModuleBytecode,
+            PythonModuleSource, PythonPackageDistributionResource,
+            PythonPackageDistributionResourceFlavor, PythonPackageResource, PythonPathExtension,
+            PythonResource,
         },
     },
     anyhow::Result,
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         ffi::OsStr,
-        iter::FromIterator,
         path::{Path, PathBuf},
     },
+    tugger_file_manifest::{File, FileData, FileEntry, FileManifest},
 };
 
 #[cfg(unix)]
@@ -91,7 +91,7 @@ pub struct PythonResourceIterator<'a> {
     /// Content overrides for individual paths.
     ///
     /// This is a hacky way to allow us to abstract I/O.
-    path_content_overrides: HashMap<PathBuf, FileData>,
+    path_content_overrides: FileManifest,
     seen_packages: HashSet<String>,
     resources: Vec<ResourceFile>,
     // Whether to emit `PythonResource::File` entries.
@@ -135,7 +135,7 @@ impl<'a> PythonResourceIterator<'a> {
             cache_tag: cache_tag.to_string(),
             suffixes: suffixes.clone(),
             paths: filtered,
-            path_content_overrides: HashMap::new(),
+            path_content_overrides: FileManifest::default(),
             seen_packages: HashSet::new(),
             resources: Vec::new(),
             emit_files,
@@ -144,14 +144,14 @@ impl<'a> PythonResourceIterator<'a> {
         }
     }
 
-    /// Construct an instance from an iterable of `(PathBuf, DataLocation)`.
+    /// Construct an instance from an iterable of `(File)`.
     pub fn from_data_locations(
-        resources: &[FileData],
+        resources: &[File],
         cache_tag: &str,
         suffixes: &PythonModuleSuffixes,
         emit_files: bool,
         emit_non_files: bool,
-    ) -> PythonResourceIterator<'a> {
+    ) -> Result<PythonResourceIterator<'a>> {
         let mut paths = resources
             .iter()
             .map(|file| PathEntry {
@@ -162,27 +162,28 @@ impl<'a> PythonResourceIterator<'a> {
             .collect::<Vec<_>>();
         paths.sort_by(|a, b| a.path.cmp(&b.path));
 
-        PythonResourceIterator {
+        let mut path_content_overrides = FileManifest::default();
+        for resource in resources {
+            path_content_overrides.add_file_entry(&resource.path, resource.entry.clone())?;
+        }
+
+        Ok(PythonResourceIterator {
             root_path: PathBuf::new(),
             cache_tag: cache_tag.to_string(),
             suffixes: suffixes.clone(),
             paths,
-            path_content_overrides: HashMap::from_iter(
-                resources
-                    .iter()
-                    .map(|file| (file.path.clone(), file.clone())),
-            ),
+            path_content_overrides,
             seen_packages: HashSet::new(),
             resources: Vec::new(),
             emit_files,
             emit_non_files,
             _phantom: std::marker::PhantomData,
-        }
+        })
     }
 
     fn resolve_is_executable(&self, path: &Path) -> bool {
         match self.path_content_overrides.get(path) {
-            Some(file) => file.is_executable,
+            Some(file) => file.executable,
             None => {
                 if let Ok(metadata) = path.metadata() {
                     is_executable(&metadata)
@@ -193,10 +194,10 @@ impl<'a> PythonResourceIterator<'a> {
         }
     }
 
-    fn resolve_data_location(&self, path: &Path) -> DataLocation {
+    fn resolve_file_data(&self, path: &Path) -> FileData {
         match self.path_content_overrides.get(path) {
             Some(file) => file.data.clone(),
-            None => DataLocation::Path(path.to_path_buf()),
+            None => FileData::Path(path.to_path_buf()),
         }
     }
 
@@ -262,7 +263,7 @@ impl<'a> PythonResourceIterator<'a> {
                     package: package.to_string(),
                     version: version.to_string(),
                     name,
-                    data: self.resolve_data_location(path),
+                    data: self.resolve_file_data(path),
                 }
                 .into(),
             ));
@@ -354,7 +355,7 @@ impl<'a> PythonResourceIterator<'a> {
                         name: full_module_name,
                         init_fn,
                         extension_file_suffix: ext_suffix.clone(),
-                        shared_library: Some(self.resolve_data_location(path)),
+                        shared_library: Some(self.resolve_file_data(path)),
                         object_file_data: vec![],
                         is_package: is_package_from_path(path),
                         link_libraries: vec![],
@@ -362,8 +363,7 @@ impl<'a> PythonResourceIterator<'a> {
                         builtin_default: false,
                         required: false,
                         variant: None,
-                        licenses: None,
-                        license_public_domain: None,
+                        license: None,
                     }
                     .into(),
                 ));
@@ -403,7 +403,7 @@ impl<'a> PythonResourceIterator<'a> {
             return Some(PathItem::PythonResource(
                 PythonModuleSource {
                     name: full_module_name,
-                    source: self.resolve_data_location(path),
+                    source: self.resolve_file_data(path),
                     is_package: is_package_from_path(&path),
                     cache_tag: self.cache_tag.clone(),
                     is_stdlib: false,
@@ -504,13 +504,13 @@ impl<'a> PythonResourceIterator<'a> {
         let resource = match rel_path.extension().and_then(OsStr::to_str) {
             Some("egg") => PathItem::PythonResource(
                 PythonEggFile {
-                    data: self.resolve_data_location(path),
+                    data: self.resolve_file_data(path),
                 }
                 .into(),
             ),
             Some("pth") => PathItem::PythonResource(
                 PythonPathExtension {
-                    data: self.resolve_data_location(path),
+                    data: self.resolve_file_data(path),
                 }
                 .into(),
             ),
@@ -552,10 +552,12 @@ impl<'a> Iterator for PythonResourceIterator<'a> {
                     .expect("unable to strip path prefix")
                     .to_path_buf();
 
-                let f = FileData {
+                let f = File {
                     path: rel_path,
-                    is_executable: self.resolve_is_executable(&self.paths[0].path),
-                    data: self.resolve_data_location(&self.paths[0].path),
+                    entry: FileEntry {
+                        executable: self.resolve_is_executable(&self.paths[0].path),
+                        data: self.resolve_file_data(&self.paths[0].path),
+                    },
                 };
 
                 return Some(Ok(f.into()));
@@ -668,7 +670,7 @@ impl<'a> Iterator for PythonResourceIterator<'a> {
             return Some(Ok(PythonPackageResource {
                 leaf_package,
                 relative_name,
-                data: self.resolve_data_location(&resource.full_path),
+                data: self.resolve_file_data(&resource.full_path),
                 is_stdlib: false,
                 is_test: false,
             }
@@ -700,25 +702,25 @@ pub fn find_python_resources<'a>(
 mod tests {
     use {
         super::*,
-        lazy_static::lazy_static,
+        once_cell::sync::Lazy,
         std::fs::{create_dir_all, write},
     };
 
     const DEFAULT_CACHE_TAG: &str = "cpython-37";
 
-    lazy_static! {
-        static ref DEFAULT_SUFFIXES: PythonModuleSuffixes = PythonModuleSuffixes {
-            source: vec![".py".to_string()],
-            bytecode: vec![".pyc".to_string()],
-            debug_bytecode: vec![],
-            optimized_bytecode: vec![],
-            extension: vec![],
-        };
-    }
+    static DEFAULT_SUFFIXES: Lazy<PythonModuleSuffixes> = Lazy::new(|| PythonModuleSuffixes {
+        source: vec![".py".to_string()],
+        bytecode: vec![".pyc".to_string()],
+        debug_bytecode: vec![],
+        optimized_bytecode: vec![],
+        extension: vec![],
+    });
 
     #[test]
     fn test_source_resolution() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let acme_path = tp.join("acme");
@@ -741,10 +743,12 @@ mod tests {
 
         assert_eq!(
             resources[0],
-            FileData {
+            File {
                 path: PathBuf::from("acme/__init__.py"),
-                is_executable: false,
-                data: DataLocation::Path(acme_path.join("__init__.py")),
+                entry: FileEntry {
+                    executable: false,
+                    data: acme_path.join("__init__.py").into(),
+                }
             }
             .into()
         );
@@ -752,7 +756,7 @@ mod tests {
             resources[1],
             PythonModuleSource {
                 name: "acme".to_string(),
-                source: DataLocation::Path(acme_path.join("__init__.py")),
+                source: FileData::Path(acme_path.join("__init__.py")),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -762,10 +766,12 @@ mod tests {
         );
         assert_eq!(
             resources[2],
-            FileData {
+            File {
                 path: PathBuf::from("acme/a/__init__.py"),
-                is_executable: false,
-                data: DataLocation::Path(acme_a_path.join("__init__.py")),
+                entry: FileEntry {
+                    executable: false,
+                    data: acme_a_path.join("__init__.py").into(),
+                }
             }
             .into()
         );
@@ -773,7 +779,7 @@ mod tests {
             resources[3],
             PythonModuleSource {
                 name: "acme.a".to_string(),
-                source: DataLocation::Path(acme_a_path.join("__init__.py")),
+                source: FileData::Path(acme_a_path.join("__init__.py")),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -783,10 +789,12 @@ mod tests {
         );
         assert_eq!(
             resources[4],
-            FileData {
+            File {
                 path: PathBuf::from("acme/a/foo.py"),
-                is_executable: false,
-                data: DataLocation::Path(acme_a_path.join("foo.py")),
+                entry: FileEntry {
+                    executable: false,
+                    data: acme_a_path.join("foo.py").into(),
+                }
             }
             .into()
         );
@@ -794,7 +802,7 @@ mod tests {
             resources[5],
             PythonModuleSource {
                 name: "acme.a.foo".to_string(),
-                source: DataLocation::Path(acme_a_path.join("foo.py")),
+                source: FileData::Path(acme_a_path.join("foo.py")),
                 is_package: false,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -804,10 +812,12 @@ mod tests {
         );
         assert_eq!(
             resources[6],
-            FileData {
+            File {
                 path: PathBuf::from("acme/bar/__init__.py"),
-                is_executable: false,
-                data: DataLocation::Path(acme_bar_path.join("__init__.py")),
+                entry: FileEntry {
+                    executable: false,
+                    data: acme_bar_path.join("__init__.py").into(),
+                }
             }
             .into()
         );
@@ -815,7 +825,7 @@ mod tests {
             resources[7],
             PythonModuleSource {
                 name: "acme.bar".to_string(),
-                source: DataLocation::Path(acme_bar_path.join("__init__.py")),
+                source: FileData::Path(acme_bar_path.join("__init__.py")),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -829,7 +839,9 @@ mod tests {
 
     #[test]
     fn test_bytecode_resolution() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let acme_path = tp.join("acme");
@@ -1105,7 +1117,9 @@ mod tests {
 
     #[test]
     fn test_site_packages() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let sp_path = tp.join("site-packages");
@@ -1125,7 +1139,7 @@ mod tests {
             resources[0],
             PythonModuleSource {
                 name: "acme".to_string(),
-                source: DataLocation::Path(acme_path.join("__init__.py")),
+                source: FileData::Path(acme_path.join("__init__.py")),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1137,7 +1151,7 @@ mod tests {
             resources[1],
             PythonModuleSource {
                 name: "acme.bar".to_string(),
-                source: DataLocation::Path(acme_path.join("bar.py")),
+                source: FileData::Path(acme_path.join("bar.py")),
                 is_package: false,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1151,7 +1165,9 @@ mod tests {
 
     #[test]
     fn test_extension_module() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         create_dir_all(&tp.join("markupsafe"))?;
@@ -1195,7 +1211,7 @@ mod tests {
                 name: "_cffi_backend".to_string(),
                 init_fn: Some("PyInit__cffi_backend".to_string()),
                 extension_file_suffix: ".cp37-win_amd64.pyd".to_string(),
-                shared_library: Some(DataLocation::Path(cffi_path)),
+                shared_library: Some(FileData::Path(cffi_path)),
                 object_file_data: vec![],
                 is_package: false,
                 link_libraries: vec![],
@@ -1203,8 +1219,7 @@ mod tests {
                 builtin_default: false,
                 required: false,
                 variant: None,
-                licenses: None,
-                license_public_domain: None,
+                license: None,
             }
             .into()
         );
@@ -1214,7 +1229,7 @@ mod tests {
                 name: "bar".to_string(),
                 init_fn: Some("PyInit_bar".to_string()),
                 extension_file_suffix: ".so".to_string(),
-                shared_library: Some(DataLocation::Path(so_path)),
+                shared_library: Some(FileData::Path(so_path)),
                 object_file_data: vec![],
                 is_package: false,
                 link_libraries: vec![],
@@ -1222,8 +1237,7 @@ mod tests {
                 builtin_default: false,
                 required: false,
                 variant: None,
-                licenses: None,
-                license_public_domain: None,
+                license: None,
             }
             .into(),
         );
@@ -1233,7 +1247,7 @@ mod tests {
                 name: "foo".to_string(),
                 init_fn: Some("PyInit_foo".to_string()),
                 extension_file_suffix: ".pyd".to_string(),
-                shared_library: Some(DataLocation::Path(pyd_path)),
+                shared_library: Some(FileData::Path(pyd_path)),
                 object_file_data: vec![],
                 is_package: false,
                 link_libraries: vec![],
@@ -1241,8 +1255,7 @@ mod tests {
                 builtin_default: false,
                 required: false,
                 variant: None,
-                licenses: None,
-                license_public_domain: None,
+                license: None,
             }
             .into(),
         );
@@ -1252,7 +1265,7 @@ mod tests {
                 name: "markupsafe._speedups".to_string(),
                 init_fn: Some("PyInit__speedups".to_string()),
                 extension_file_suffix: ".cpython-37m-x86_64-linux-gnu.so".to_string(),
-                shared_library: Some(DataLocation::Path(markupsafe_speedups_path)),
+                shared_library: Some(FileData::Path(markupsafe_speedups_path)),
                 object_file_data: vec![],
                 is_package: false,
                 link_libraries: vec![],
@@ -1260,8 +1273,7 @@ mod tests {
                 builtin_default: false,
                 required: false,
                 variant: None,
-                licenses: None,
-                license_public_domain: None,
+                license: None,
             }
             .into(),
         );
@@ -1271,7 +1283,7 @@ mod tests {
                 name: "zstd".to_string(),
                 init_fn: Some("PyInit_zstd".to_string()),
                 extension_file_suffix: ".cpython-37m-x86_64-linux-gnu.so".to_string(),
-                shared_library: Some(DataLocation::Path(zstd_path)),
+                shared_library: Some(FileData::Path(zstd_path)),
                 object_file_data: vec![],
                 is_package: false,
                 link_libraries: vec![],
@@ -1279,8 +1291,7 @@ mod tests {
                 builtin_default: false,
                 required: false,
                 variant: None,
-                licenses: None,
-                license_public_domain: None,
+                license: None,
             }
             .into(),
         );
@@ -1290,7 +1301,9 @@ mod tests {
 
     #[test]
     fn test_egg_file() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         create_dir_all(&tp)?;
@@ -1306,7 +1319,7 @@ mod tests {
         assert_eq!(
             resources[0],
             PythonEggFile {
-                data: DataLocation::Path(egg_path)
+                data: FileData::Path(egg_path)
             }
             .into()
         );
@@ -1316,7 +1329,9 @@ mod tests {
 
     #[test]
     fn test_egg_dir() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         create_dir_all(&tp)?;
@@ -1341,7 +1356,7 @@ mod tests {
             resources[0],
             PythonModuleSource {
                 name: "foo".to_string(),
-                source: DataLocation::Path(package_path.join("__init__.py")),
+                source: FileData::Path(package_path.join("__init__.py")),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1353,7 +1368,7 @@ mod tests {
             resources[1],
             PythonModuleSource {
                 name: "foo.bar".to_string(),
-                source: DataLocation::Path(package_path.join("bar.py")),
+                source: FileData::Path(package_path.join("bar.py")),
                 is_package: false,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1367,7 +1382,9 @@ mod tests {
 
     #[test]
     fn test_pth_file() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         create_dir_all(&tp)?;
@@ -1383,7 +1400,7 @@ mod tests {
         assert_eq!(
             resources[0],
             PythonPathExtension {
-                data: DataLocation::Path(pth_path)
+                data: FileData::Path(pth_path)
             }
             .into()
         );
@@ -1394,16 +1411,19 @@ mod tests {
     /// Resource files without a package are not valid.
     #[test]
     fn test_root_resource_file() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let resource_path = tp.join("resource.txt");
         write(&resource_path, "content")?;
 
-        let resources =
+        assert!(
             PythonResourceIterator::new(tp, DEFAULT_CACHE_TAG, &DEFAULT_SUFFIXES, false, true)
-                .collect::<Vec<_>>();
-        assert!(resources.is_empty());
+                .next()
+                .is_none()
+        );
 
         Ok(())
     }
@@ -1411,7 +1431,9 @@ mod tests {
     /// Resource files in a relative directory without a package are not valid.
     #[test]
     fn test_relative_resource_no_package() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         write(&tp.join("foo.py"), "")?;
@@ -1430,7 +1452,7 @@ mod tests {
             resources[0],
             PythonModuleSource {
                 name: "foo".to_string(),
-                source: DataLocation::Path(tp.join("foo.py")),
+                source: FileData::Path(tp.join("foo.py")),
                 is_package: false,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1445,7 +1467,9 @@ mod tests {
     /// Resource files next to a package are detected.
     #[test]
     fn test_relative_package_resource() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let package_dir = tp.join("foo");
@@ -1465,7 +1489,7 @@ mod tests {
             resources[0],
             PythonModuleSource {
                 name: "foo".to_string(),
-                source: DataLocation::Path(module_path),
+                source: FileData::Path(module_path),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1478,7 +1502,7 @@ mod tests {
             PythonPackageResource {
                 leaf_package: "foo".to_string(),
                 relative_name: "resource.txt".to_string(),
-                data: DataLocation::Path(resource_path),
+                data: FileData::Path(resource_path),
                 is_stdlib: false,
                 is_test: false,
             }
@@ -1491,7 +1515,9 @@ mod tests {
     /// Resource files in sub-directory are detected.
     #[test]
     fn test_subdirectory_resource() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let package_dir = tp.join("foo");
@@ -1512,7 +1538,7 @@ mod tests {
             resources[0],
             PythonModuleSource {
                 name: "foo".to_string(),
-                source: DataLocation::Path(module_path),
+                source: FileData::Path(module_path),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1525,7 +1551,7 @@ mod tests {
             PythonPackageResource {
                 leaf_package: "foo".to_string(),
                 relative_name: "resources/resource.txt".to_string(),
-                data: DataLocation::Path(resource_path),
+                data: FileData::Path(resource_path),
                 is_stdlib: false,
                 is_test: false,
             }
@@ -1538,7 +1564,9 @@ mod tests {
     /// .dist-info directory ignored if METADATA file not present.
     #[test]
     fn test_distinfo_missing_metadata() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let dist_path = tp.join("foo-1.2.dist-info");
@@ -1557,7 +1585,9 @@ mod tests {
     /// .dist-info with invalid METADATA file has no content emitted.
     #[test]
     fn test_distinfo_bad_metadata() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let dist_path = tp.join("foo-1.2.dist-info");
@@ -1578,7 +1608,9 @@ mod tests {
     /// .dist-info with partial METADATA content has no content emitted.
     #[test]
     fn test_distinfo_partial_metadata() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let dist_path = tp.join("black-1.2.3.dist-info");
@@ -1599,7 +1631,9 @@ mod tests {
     /// .dist-info with partial METADATA content has no content emitted.
     #[test]
     fn test_distinfo_valid_metadata() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let dist_path = tp.join("black-1.2.3.dist-info");
@@ -1626,7 +1660,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "METADATA".to_string(),
-                data: DataLocation::Path(metadata_path),
+                data: FileData::Path(metadata_path),
             }
             .into()
         );
@@ -1637,7 +1671,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "file.txt".to_string(),
-                data: DataLocation::Path(resource_path),
+                data: FileData::Path(resource_path),
             }
             .into()
         );
@@ -1648,7 +1682,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "subdir/sub.txt".to_string(),
-                data: DataLocation::Path(subdir_resource_path),
+                data: FileData::Path(subdir_resource_path),
             }
             .into()
         );
@@ -1659,7 +1693,9 @@ mod tests {
     /// .dist-info with partial METADATA content has no content emitted.
     #[test]
     fn test_egginfo_valid_metadata() -> Result<()> {
-        let td = tempdir::TempDir::new("pyoxidizer-test")?;
+        let td = tempfile::Builder::new()
+            .prefix("python-packaging-test")
+            .tempdir()?;
         let tp = td.path();
 
         let egg_path = tp.join("black-1.2.3.egg-info");
@@ -1686,7 +1722,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "PKG-INFO".to_string(),
-                data: DataLocation::Path(metadata_path),
+                data: FileData::Path(metadata_path),
             }
             .into()
         );
@@ -1697,7 +1733,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "file.txt".to_string(),
-                data: DataLocation::Path(resource_path),
+                data: FileData::Path(resource_path),
             }
             .into()
         );
@@ -1708,7 +1744,7 @@ mod tests {
                 package: "black".to_string(),
                 version: "1.2.3".to_string(),
                 name: "subdir/sub.txt".to_string(),
-                data: DataLocation::Path(subdir_resource_path),
+                data: FileData::Path(subdir_resource_path),
             }
             .into()
         );
@@ -1719,15 +1755,19 @@ mod tests {
     #[test]
     fn test_memory_resources() -> Result<()> {
         let inputs = vec![
-            FileData {
+            File {
                 path: PathBuf::from("foo/__init__.py"),
-                is_executable: false,
-                data: DataLocation::Memory(vec![0]),
+                entry: FileEntry {
+                    executable: false,
+                    data: vec![0].into(),
+                },
             },
-            FileData {
+            File {
                 path: PathBuf::from("foo/bar.py"),
-                is_executable: true,
-                data: DataLocation::Memory(vec![1]),
+                entry: FileEntry {
+                    executable: true,
+                    data: vec![1].into(),
+                },
             },
         ];
 
@@ -1737,16 +1777,18 @@ mod tests {
             &DEFAULT_SUFFIXES,
             true,
             true,
-        )
+        )?
         .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(resources.len(), 4);
         assert_eq!(
             resources[0],
-            FileData {
+            File {
                 path: PathBuf::from("foo/__init__.py"),
-                is_executable: false,
-                data: DataLocation::Memory(vec![0]),
+                entry: FileEntry {
+                    executable: false,
+                    data: vec![0].into(),
+                }
             }
             .into()
         );
@@ -1754,7 +1796,7 @@ mod tests {
             resources[1],
             PythonModuleSource {
                 name: "foo".to_string(),
-                source: DataLocation::Memory(vec![0]),
+                source: FileData::Memory(vec![0]),
                 is_package: true,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,
@@ -1764,10 +1806,12 @@ mod tests {
         );
         assert_eq!(
             resources[2],
-            FileData {
+            File {
                 path: PathBuf::from("foo/bar.py"),
-                is_executable: true,
-                data: DataLocation::Memory(vec![1]),
+                entry: FileEntry {
+                    executable: true,
+                    data: vec![1].into(),
+                }
             }
             .into()
         );
@@ -1775,7 +1819,7 @@ mod tests {
             resources[3],
             PythonModuleSource {
                 name: "foo.bar".to_string(),
-                source: DataLocation::Memory(vec![1]),
+                source: FileData::Memory(vec![1]),
                 is_package: false,
                 cache_tag: DEFAULT_CACHE_TAG.to_string(),
                 is_stdlib: false,

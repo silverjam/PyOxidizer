@@ -5,232 +5,33 @@
 //! Manage an embedded Python interpreter.
 
 use {
-    super::config::OxidizedPythonInterpreterConfig,
-    super::conversion::osstring_to_bytes,
-    super::importer::{
-        initialize_importer, PyInit_oxidized_importer, OXIDIZED_IMPORTER_NAME,
-        OXIDIZED_IMPORTER_NAME_STR,
+    crate::{
+        config::{OxidizedPythonInterpreterConfig, ResolvedOxidizedPythonInterpreterConfig},
+        conversion::osstring_to_bytes,
+        error::NewInterpreterError,
+        importer::{
+            replace_meta_path_importers, PyInit_oxidized_importer, OXIDIZED_IMPORTER_NAME,
+            OXIDIZED_IMPORTER_NAME_STR,
+        },
+        osutils::resolve_terminfo_dirs,
+        pyalloc::PythonMemoryAllocator,
+        python_resources::PythonResourcesState,
     },
-    super::interpreter_config::python_interpreter_config_to_py_pre_config,
-    super::osutils::resolve_terminfo_dirs,
-    super::pyalloc::{make_raw_rust_memory_allocator, RawAllocator},
-    super::python_resources::PythonResourcesState,
-    cpython::{
-        GILGuard, NoArgs, ObjectProtocol, PyDict, PyErr, PyList, PyString, Python, ToPyObject,
-    },
-    lazy_static::lazy_static,
+    cpython::{GILGuard, NoArgs, ObjectProtocol, PyDict, PyList, PyString, Python, ToPyObject},
+    once_cell::sync::Lazy,
     python3_sys as pyffi,
-    python_packaging::interpreter::{MemoryAllocatorBackend, TerminfoResolution},
-    std::collections::BTreeSet,
-    std::convert::TryInto,
-    std::env,
-    std::ffi::{CStr, OsString},
-    std::fmt::{Display, Formatter},
-    std::fs,
-    std::io::Write,
-    std::path::PathBuf,
+    python_packaging::interpreter::TerminfoResolution,
+    std::{
+        collections::BTreeSet,
+        convert::{TryFrom, TryInto},
+        env, fs,
+        io::Write,
+        path::{Path, PathBuf},
+    },
 };
 
-#[cfg(target_family = "unix")]
-use std::{
-    ffi::{CString, NulError},
-    os::unix::ffi::OsStrExt,
-};
-
-#[cfg(target_family = "windows")]
-use std::os::windows::ffi::OsStrExt;
-
-#[cfg(feature = "jemalloc-sys")]
-use super::pyalloc::make_raw_jemalloc_allocator;
-use python3_sys::PyMemAllocatorEx;
-
-lazy_static! {
-    static ref GLOBAL_INTERPRETER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-}
-
-#[cfg(feature = "jemalloc-sys")]
-fn raw_jemallocator() -> pyffi::PyMemAllocatorEx {
-    make_raw_jemalloc_allocator()
-}
-
-#[cfg(not(feature = "jemalloc-sys"))]
-fn raw_jemallocator() -> pyffi::PyMemAllocatorEx {
-    panic!("jemalloc is not available in this build configuration");
-}
-
-/// Format a PyErr in a crude manner.
-///
-/// This is meant to be called during interpreter initialization. We can't
-/// call PyErr_Print() because sys.stdout may not be available yet.
-fn format_pyerr(py: Python, err: PyErr) -> Result<String, &'static str> {
-    let type_repr = err
-        .ptype
-        .repr(py)
-        .map_err(|_| "unable to get repr of error type")?;
-
-    if let Some(value) = &err.pvalue {
-        let value_repr = value
-            .repr(py)
-            .map_err(|_| "unable to get repr of error value")?;
-
-        let value = format!(
-            "{}: {}",
-            type_repr.to_string_lossy(py),
-            value_repr.to_string_lossy(py)
-        );
-
-        Ok(value)
-    } else {
-        Ok(type_repr.to_string_lossy(py).to_string())
-    }
-}
-
-/// Represents an error encountered when creating an embedded Python interpreter.
-#[derive(Debug)]
-pub enum NewInterpreterError {
-    Simple(&'static str),
-    Dynamic(String),
-}
-
-impl From<&'static str> for NewInterpreterError {
-    fn from(v: &'static str) -> Self {
-        NewInterpreterError::Simple(v)
-    }
-}
-
-impl Display for NewInterpreterError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            NewInterpreterError::Simple(value) => value.fmt(f),
-            NewInterpreterError::Dynamic(value) => value.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for NewInterpreterError {}
-
-impl NewInterpreterError {
-    pub fn new_from_pyerr(py: Python, err: PyErr, context: &str) -> Self {
-        match format_pyerr(py, err) {
-            Ok(value) => NewInterpreterError::Dynamic(format!("during {}: {}", context, value)),
-            Err(msg) => NewInterpreterError::Dynamic(format!("during {}: {}", context, msg)),
-        }
-    }
-
-    pub fn new_from_pystatus(status: &pyffi::PyStatus, context: &str) -> Self {
-        if !status.func.is_null() && !status.err_msg.is_null() {
-            let func = unsafe { CStr::from_ptr(status.func) };
-            let msg = unsafe { CStr::from_ptr(status.err_msg) };
-
-            NewInterpreterError::Dynamic(format!(
-                "during {}: {}: {}",
-                context,
-                func.to_string_lossy(),
-                msg.to_string_lossy()
-            ))
-        } else if !status.err_msg.is_null() {
-            let msg = unsafe { CStr::from_ptr(status.err_msg) };
-
-            NewInterpreterError::Dynamic(format!("during {}: {}", context, msg.to_string_lossy()))
-        } else {
-            NewInterpreterError::Dynamic(format!("during {}: could not format PyStatus", context))
-        }
-    }
-}
-
-enum InterpreterRawAllocator {
-    Python(pyffi::PyMemAllocatorEx),
-    Raw(RawAllocator),
-}
-
-impl InterpreterRawAllocator {
-    fn as_ptr(&self) -> *const pyffi::PyMemAllocatorEx {
-        match self {
-            InterpreterRawAllocator::Python(alloc) => alloc as *const _,
-            InterpreterRawAllocator::Raw(alloc) => &alloc.allocator as *const _,
-        }
-    }
-}
-
-impl From<pyffi::PyMemAllocatorEx> for InterpreterRawAllocator {
-    fn from(allocator: PyMemAllocatorEx) -> Self {
-        InterpreterRawAllocator::Python(allocator)
-    }
-}
-
-impl From<RawAllocator> for InterpreterRawAllocator {
-    fn from(allocator: RawAllocator) -> Self {
-        InterpreterRawAllocator::Raw(allocator)
-    }
-}
-
-#[cfg(target_family = "unix")]
-pub fn set_argv(
-    config: &mut pyffi::PyConfig,
-    args: &[OsString],
-) -> Result<(), NewInterpreterError> {
-    let argc = args.len() as isize;
-    let argv = args
-        .iter()
-        .map(|x| CString::new(x.as_bytes()))
-        .collect::<Result<Vec<_>, NulError>>()
-        .map_err(|_| NewInterpreterError::Simple("unable to construct C string from OsString"))?;
-    let argvp = argv
-        .iter()
-        .map(|x| x.as_ptr() as *mut i8)
-        .collect::<Vec<_>>();
-
-    let status = unsafe { pyffi::PyConfig_SetBytesArgv(config as *mut _, argc, argvp.as_ptr()) };
-
-    if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(NewInterpreterError::new_from_pystatus(
-            &status,
-            "setting argv",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_family = "windows")]
-pub fn set_argv(
-    config: &mut pyffi::PyConfig,
-    args: &[OsString],
-) -> Result<(), NewInterpreterError> {
-    let argc = args.len() as isize;
-    let argv = args
-        .iter()
-        .map(|x| {
-            let mut buffer = x.encode_wide().collect::<Vec<u16>>();
-            buffer.push(0);
-
-            buffer
-        })
-        .collect::<Vec<_>>();
-    let argvp = argv
-        .iter()
-        .map(|x| x.as_ptr() as *mut u16)
-        .collect::<Vec<_>>();
-
-    let status = unsafe { pyffi::PyConfig_SetArgv(config as *mut _, argc, argvp.as_ptr()) };
-
-    if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
-        Err(NewInterpreterError::new_from_pystatus(
-            &status,
-            "setting argv",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum InterpreterState {
-    NotStarted,
-    Initializing,
-    Initialized,
-    Finalized,
-}
+static GLOBAL_INTERPRETER_GUARD: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
 
 /// Manages an embedded Python interpreter.
 ///
@@ -247,31 +48,15 @@ enum InterpreterState {
 ///
 /// Both the low-level `python3-sys` and higher-level `cpython` crates are used.
 pub struct MainPythonInterpreter<'python, 'interpreter: 'python, 'resources: 'interpreter> {
-    config: OxidizedPythonInterpreterConfig<'resources>,
-    interpreter_state: InterpreterState,
+    // It is possible to have a use-after-free if config is dropped before the
+    // interpreter is finalized/dropped.
+    config: ResolvedOxidizedPythonInterpreterConfig<'resources>,
     interpreter_guard: Option<std::sync::MutexGuard<'interpreter, ()>>,
-    raw_allocator: Option<InterpreterRawAllocator>,
+    pub(crate) allocator: Option<PythonMemoryAllocator>,
     gil: Option<GILGuard>,
     py: Option<Python<'python>>,
-    /// Holds parsed resources state.
-    ///
-    /// The underling data backing this data structure is given an
-    /// explicit lifetime, independent of the GIL. The lifetime should be
-    /// that of this instance and no shorter.
-    ///
-    /// While this type doesn't access this field for any meaningful
-    /// work, we need to hold on to a reference to the parsed resources
-    /// data/state because the importer is storing a pointer to it. The
-    /// reason it is storing a pointer and not a normal &ref is because
-    /// the cpython bindings require that all class data elements be
-    /// 'static. If we stored the PythonResourcesState as a normal Rust
-    /// ref, we would require it be 'static. In reality, resources only
-    /// need to live for the lifetime of the interpreter instance, which
-    /// is shorter than 'static. So we cheat and store a pointer. And to
-    /// ensure the memory behind that pointer isn't freed, we track it
-    /// in this field. We also store the object in a box so it is on the
-    /// heap and not dynamic.
-    resources_state: Option<Box<PythonResourcesState<'resources, u8>>>,
+    /// File to write containing list of modules when the interpreter finalizes.
+    write_modules_path: Option<PathBuf>,
 }
 
 impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpreter, 'resources> {
@@ -281,6 +66,8 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
     pub fn new(
         config: OxidizedPythonInterpreterConfig<'resources>,
     ) -> Result<MainPythonInterpreter<'python, 'interpreter, 'resources>, NewInterpreterError> {
+        let config: ResolvedOxidizedPythonInterpreterConfig<'resources> = config.try_into()?;
+
         match config.terminfo_resolution {
             TerminfoResolution::Dynamic => {
                 if let Some(v) = resolve_terminfo_dirs() {
@@ -296,11 +83,10 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
         let mut res = MainPythonInterpreter {
             config,
             interpreter_guard: None,
-            interpreter_state: InterpreterState::NotStarted,
-            raw_allocator: None,
+            allocator: None,
             gil: None,
             py: None,
-            resources_state: None,
+            write_modules_path: None,
         };
 
         res.init()?;
@@ -321,41 +107,21 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
     ///
     /// Returns a Python instance which has the GIL acquired.
     fn init(&mut self) -> Result<(), NewInterpreterError> {
-        match &self.interpreter_state {
-            InterpreterState::Initializing => {
-                return Err(NewInterpreterError::Simple(
-                    "interpreter in initializing state",
-                ))
-            }
-            InterpreterState::Initialized => {
-                return Ok(());
-            }
-            InterpreterState::NotStarted => {}
-            InterpreterState::Finalized => {}
-        }
-
         assert!(self.interpreter_guard.is_none());
         self.interpreter_guard = Some(GLOBAL_INTERPRETER_GUARD.lock().map_err(|_| {
             NewInterpreterError::Simple("unable to acquire global interpreter guard")
         })?);
 
-        self.interpreter_state = InterpreterState::Initializing;
+        let origin_string = self.config.origin().display().to_string();
 
-        let origin = self
-            .config
-            .ensure_origin()
-            .map_err(|e| NewInterpreterError::Simple(e))?;
-        let origin_string = origin.display().to_string();
-        self.config
-            .resolve_module_search_paths()
-            .map_err(|e| NewInterpreterError::Simple(e))?;
+        if let Some(tcl_library) = &self.config.tcl_library {
+            std::env::set_var("TCL_LIBRARY", tcl_library);
+        }
 
         set_pyimport_inittab(&self.config);
 
         // Pre-configure Python.
-        let pre_config =
-            python_interpreter_config_to_py_pre_config(&self.config.interpreter_config)
-                .map_err(NewInterpreterError::Dynamic)?;
+        let pre_config = pyffi::PyPreConfig::try_from(&self.config)?;
 
         unsafe {
             let status = pyffi::Py_PreInitialize(&pre_config);
@@ -368,48 +134,44 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
             }
         };
 
-        // Override the raw allocator if one is configured.
-        if let Some(raw_allocator) = &self.config.raw_allocator {
-            match raw_allocator.backend {
-                MemoryAllocatorBackend::System => {}
-                MemoryAllocatorBackend::Jemalloc => {
-                    self.raw_allocator = Some(InterpreterRawAllocator::from(raw_jemallocator()));
-                }
-                MemoryAllocatorBackend::Rust => {
-                    self.raw_allocator = Some(InterpreterRawAllocator::from(
-                        make_raw_rust_memory_allocator(),
-                    ));
-                }
+        // Set the memory allocator domains if they are configured.
+        self.allocator = PythonMemoryAllocator::from_backend(self.config.allocator_backend);
+
+        if let Some(allocator) = &self.allocator {
+            if self.config.allocator_raw {
+                allocator.set_allocator(pyffi::PyMemAllocatorDomain::PYMEM_DOMAIN_RAW);
             }
 
-            if let Some(allocator) = &self.raw_allocator {
-                unsafe {
-                    pyffi::PyMem_SetAllocator(
-                        pyffi::PyMemAllocatorDomain::PYMEM_DOMAIN_RAW,
-                        allocator.as_ptr() as *mut _,
-                    );
-                }
+            if self.config.allocator_mem {
+                allocator.set_allocator(pyffi::PyMemAllocatorDomain::PYMEM_DOMAIN_MEM);
             }
 
-            if raw_allocator.debug {
-                unsafe {
-                    pyffi::PyMem_SetupDebugHooks();
+            if self.config.allocator_obj {
+                allocator.set_allocator(pyffi::PyMemAllocatorDomain::PYMEM_DOMAIN_OBJ);
+            }
+
+            if self.config.allocator_pymalloc_arena {
+                if self.config.allocator_mem || self.config.allocator_obj {
+                    return Err(NewInterpreterError::Simple("A custom pymalloc arena allocator cannot be used with custom `mem` or `obj` domain allocators"));
                 }
+
+                allocator.set_arena_allocator();
             }
         }
 
-        let mut py_config: pyffi::PyConfig = (&self.config)
-            .try_into()
-            .map_err(NewInterpreterError::Dynamic)?;
+        // Debug hooks apply to all allocator domains and work with or without
+        // custom domain allocators.
+        if self.config.allocator_debug {
+            unsafe {
+                pyffi::PyMem_SetupDebugHooks();
+            }
+        }
+
+        let mut py_config: pyffi::PyConfig = (&self.config).try_into()?;
 
         // Enable multi-phase initialization. This allows us to initialize
         // our custom importer before Python attempts any imports.
         py_config._init_main = 0;
-
-        // Set PyConfig.argv if we didn't do so already.
-        if let Some(args) = self.config.resolve_sys_argv() {
-            set_argv(&mut py_config, &args)?;
-        }
 
         let status = unsafe { pyffi::Py_InitializeFromConfig(&py_config) };
         if unsafe { pyffi::PyStatus_Exception(status) } != 0 {
@@ -425,34 +187,31 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
         // inject our custom importer.
 
         let py = unsafe { Python::assume_gil_acquired() };
+        self.py = Some(py);
 
         if self.config.oxidized_importer {
-            self.resources_state = Some(Box::new(
-                PythonResourcesState::new_from_env()
-                    .map_err(|err| NewInterpreterError::Simple(err))?,
-            ));
+            let resources_state = Box::new(PythonResourcesState::try_from(&self.config)?);
 
-            if let Some(ref mut resources_state) = self.resources_state {
-                resources_state
-                    .load(&self.config.packed_resources)
-                    .map_err(|err| NewInterpreterError::Simple(err))?;
+            let oxidized_importer = py.import(OXIDIZED_IMPORTER_NAME_STR).map_err(|err| {
+                NewInterpreterError::new_from_pyerr(py, err, "import of oxidized importer module")
+            })?;
 
-                let oxidized_importer = py.import(OXIDIZED_IMPORTER_NAME_STR).map_err(|err| {
-                    NewInterpreterError::new_from_pyerr(
-                        py,
-                        err,
-                        "import of oxidized importer module",
-                    )
-                })?;
-
-                initialize_importer(py, &oxidized_importer, resources_state).map_err(|err| {
+            // Ownership of the resources state is transferred into the importer, where the Box
+            // is summarily leaked. However, the importer tracks a pointer to the resources state
+            // and will constitute the struct for dropping when it itself is dropped. We could
+            // potentially encounter a use-after-free if the importer is used after self.config
+            // is dropped. However, that would require self to be dropped. And if self is dropped,
+            // there should no longer be a Python interpreter around. So it follows that the
+            // importer state cannot be dropped after self.
+            replace_meta_path_importers(py, &oxidized_importer, resources_state).map_err(
+                |err| {
                     NewInterpreterError::new_from_pyerr(
                         py,
                         err,
                         "initialization of oxidized importer",
                     )
-                })?;
-            }
+                },
+            )?;
         }
 
         // Now proceed with the Python main initialization. This will initialize
@@ -495,9 +254,6 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
          *
          * PyObject_SetArenaAllocator()
          */
-
-        self.py = Some(py);
-        self.interpreter_state = InterpreterState::Initialized;
 
         if self.config.argvb {
             let args_objs = self
@@ -556,33 +312,62 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
             }
         }
 
+        if let Some(key) = &self.config.write_modules_directory_env {
+            if let Ok(path) = std::env::var(key) {
+                let path = PathBuf::from(path);
+
+                std::fs::create_dir_all(&path).map_err(|e| {
+                    NewInterpreterError::Dynamic(format!(
+                        "error creating directory for loaded modules files: {}",
+                        e.to_string()
+                    ))
+                })?;
+
+                // We use Python's uuid module to generate a filename. This avoids
+                // a dependency on a Rust crate, which cuts down on dependency bloat.
+                let uuid_mod = py.import("uuid").map_err(|e| {
+                    NewInterpreterError::new_from_pyerr(py, e, "importing uuid module")
+                })?;
+                let uuid = uuid_mod.call(py, "uuid4", NoArgs, None).map_err(|e| {
+                    NewInterpreterError::new_from_pyerr(py, e, "calling uuid.uuid()")
+                })?;
+                let uuid_str = uuid
+                    .str(py)
+                    .map_err(|e| {
+                        NewInterpreterError::new_from_pyerr(py, e, "converting uuid to str")
+                    })?
+                    .to_string(py)
+                    .map_err(|e| {
+                        NewInterpreterError::new_from_pyerr(
+                            py,
+                            e,
+                            "converting uuid str to Rust string",
+                        )
+                    })?
+                    .to_string();
+
+                self.write_modules_path =
+                    Some(PathBuf::from(path).join(format!("modules-{}", uuid_str)));
+            }
+        }
+
         Ok(())
     }
 
     /// Ensure the Python GIL is released.
     pub fn release_gil(&mut self) {
-        if self.py.is_some() {
-            self.py = None;
-            self.gil = None;
-        }
+        self.py = None;
+        self.gil = None;
     }
 
     /// Ensure the Python GIL is acquired, returning a handle on the interpreter.
-    pub fn acquire_gil(&mut self) -> Result<Python<'python>, &'static str> {
-        match self.interpreter_state {
-            InterpreterState::NotStarted => {
-                return Err("interpreter not initialized");
-            }
-            InterpreterState::Initializing => {
-                return Err("interpreter not fully initialized");
-            }
-            InterpreterState::Initialized => {}
-            InterpreterState::Finalized => {
-                return Err("interpreter is finalized");
-            }
-        }
-
-        Ok(match self.py {
+    ///
+    /// The returned value has a lifetime of the `MainPythonInterpreter`
+    /// instance. This is because `MainPythonInterpreter.drop()` finalizes
+    /// the interpreter. The borrow checker should refuse to compile code
+    /// where the returned `Python` outlives `self`.
+    pub fn acquire_gil(&mut self) -> Python<'_> {
+        match self.py {
             Some(py) => py,
             None => {
                 let gil = GILGuard::acquire();
@@ -593,47 +378,21 @@ impl<'python, 'interpreter, 'resources> MainPythonInterpreter<'python, 'interpre
 
                 py
             }
-        })
+        }
     }
 
-    /// Runs the Python interpreter in the context of a main() function.
+    /// Runs `Py_RunMain()` and finalizes the interpreter.
     ///
-    /// This will execute whatever is configured by
-    /// `OxidizedPythonInterpreterConfig.run` and return an integer suitable
-    /// for use as a process exit code.
+    /// This will execute whatever is configured by the Python interpreter config
+    /// and return an integer suitable for use as a process exit code.
     ///
-    /// The `PythonRunMode::Eval`, `PythonRunMode::File`, and
-    /// `PythonRunMode::Module`, and `PythonRunMode::Repl` run modes are
-    /// evaluated via `Py_RunMain()`. `PythonRunMode::None` simply returns 0.
-    ///
-    /// `Py_RunMain` is the most robust mechanism to run code, files, or
-    /// modules, as `Py_RunMain()` invokes the same APIs that `python` would.
-    /// By contrast, the `run()`, `run_module_as_main()`, `run_code()`,
-    /// `run_file()`, and `run_repl()` functions in the `python_eval` module
-    /// reimplement functionality and may behave subtly different from what
-    /// `python` would do. If you want the evaluation to behave like `python`,
-    /// you should call this function.
-    ///
-    /// A downside to calling this function is that `Py_RunMain()` will finalize
-    /// the interpreter and only gives you an exit code: there is no opportunity
-    /// to inspect the return value or handle an uncaught exception. If you want
-    /// to keep the interpreter alive or inspect the evaluation result, consider
-    /// calling a function in the `python_eval` module.
-    pub fn run_as_main(&mut self) -> i32 {
-        if self.config.uses_py_runmain() {
-            let res = unsafe { pyffi::Py_RunMain() };
-
-            // Py_RunMain() finalizes the interpreter. So drop our refs and state.
-            self.interpreter_guard = None;
-            self.interpreter_state = InterpreterState::Finalized;
-            self.resources_state = None;
-            self.py = None;
-            self.gil = None;
-
-            res
-        } else {
-            0
-        }
+    /// Calling this function will finalize the interpreter and only gives you an
+    /// exit code: there is no opportunity to inspect the return value or handle
+    /// an uncaught exception. If you want to keep the interpreter alive or inspect
+    /// the evaluation result, consider calling a function on the interpreter handle
+    /// that executes code.
+    pub fn py_runmain(self) -> i32 {
+        unsafe { pyffi::Py_RunMain() }
     }
 }
 
@@ -711,14 +470,8 @@ fn set_pyimport_inittab(config: &OxidizedPythonInterpreterConfig) {
 /// Given a Python interpreter and a path to a directory, this will create a
 /// file in that directory named ``modules-<UUID>`` and write a ``\n`` delimited
 /// list of loaded names from ``sys.modules`` into that file.
-fn write_modules_to_directory(py: Python, path: &PathBuf) -> Result<(), &'static str> {
+fn write_modules_to_path(py: Python, path: &Path) -> Result<(), &'static str> {
     // TODO this needs better error handling all over.
-
-    fs::create_dir_all(path).map_err(|_| "could not create directory for modules")?;
-
-    let rand = uuid::Uuid::new_v4();
-
-    let path = path.join(format!("modules-{}", rand.to_string()));
 
     let sys = py
         .import("sys")
@@ -753,14 +506,9 @@ impl<'python, 'interpreter, 'resources> Drop
     for MainPythonInterpreter<'python, 'interpreter, 'resources>
 {
     fn drop(&mut self) {
-        if let Some(key) = &self.config.write_modules_directory_env {
-            if let Ok(path) = env::var(key) {
-                let path = PathBuf::from(path);
-                let py = self.acquire_gil().unwrap();
-
-                if let Err(msg) = write_modules_to_directory(py, &path) {
-                    eprintln!("error writing modules file: {}", msg);
-                }
+        if let Some(path) = self.write_modules_path.clone() {
+            if let Err(msg) = write_modules_to_path(self.acquire_gil(), &path) {
+                eprintln!("error writing modules file: {}", msg);
             }
         }
 

@@ -4,7 +4,7 @@
 
 /*! Declares the foundational data primitives inside packed resources data. */
 
-use std::{borrow::Cow, collections::HashMap, convert::TryFrom, iter::FromIterator, path::Path};
+use std::{borrow::Cow, collections::HashMap, convert::TryFrom, path::Path};
 
 /// Header value for version 2 of resources payload.
 pub const HEADER_V3: &[u8] = b"pyembed\x03";
@@ -29,9 +29,9 @@ impl Default for ResourceFlavor {
     }
 }
 
-impl Into<u8> for ResourceFlavor {
-    fn into(self) -> u8 {
-        match self {
+impl From<ResourceFlavor> for u8 {
+    fn from(source: ResourceFlavor) -> Self {
+        match source {
             ResourceFlavor::None => 0x00,
             ResourceFlavor::Module => 0x01,
             ResourceFlavor::BuiltinExtensionModule => 0x02,
@@ -72,9 +72,9 @@ pub enum BlobInteriorPadding {
     Null = 0x02,
 }
 
-impl Into<u8> for &BlobInteriorPadding {
-    fn into(self) -> u8 {
-        match self {
+impl From<&BlobInteriorPadding> for u8 {
+    fn from(source: &BlobInteriorPadding) -> Self {
+        match source {
             BlobInteriorPadding::None => 0x01,
             BlobInteriorPadding::Null => 0x02,
         }
@@ -92,9 +92,9 @@ pub enum BlobSectionField {
     InteriorPadding = 0x05,
 }
 
-impl Into<u8> for BlobSectionField {
-    fn into(self) -> u8 {
-        match self {
+impl From<BlobSectionField> for u8 {
+    fn from(source: BlobSectionField) -> u8 {
+        match source {
             BlobSectionField::EndOfIndex => 0x00,
             BlobSectionField::StartOfEntry => 0x01,
             BlobSectionField::ResourceFieldType => 0x02,
@@ -158,9 +158,9 @@ pub enum ResourceField {
     FileDataUtf8RelativePath = 0x1e,
 }
 
-impl Into<u8> for ResourceField {
-    fn into(self) -> u8 {
-        match self {
+impl From<ResourceField> for u8 {
+    fn from(field: ResourceField) -> Self {
+        match field {
             ResourceField::EndOfIndex => 0x00,
             ResourceField::StartOfEntry => 0x01,
             ResourceField::Flavor => 0x02,
@@ -405,6 +405,85 @@ impl<'a, X> Resource<'a, X>
 where
     [X]: ToOwned<Owned = Vec<X>>,
 {
+    /// Merge another resource into this one.
+    ///
+    /// Fields from other will overwrite fields from self.
+    pub fn merge_from(&mut self, other: Resource<'a, X>) -> Result<(), &'static str> {
+        if self.name != other.name {
+            return Err("resource names must be identical to perform a merge");
+        }
+
+        self.is_module |= other.is_module;
+        self.is_builtin_extension_module |= other.is_builtin_extension_module;
+        self.is_frozen_module |= other.is_frozen_module;
+        self.is_extension_module |= other.is_extension_module;
+        self.is_shared_library |= other.is_shared_library;
+        self.is_utf8_filename_data |= other.is_utf8_filename_data;
+        self.is_package |= other.is_package;
+        self.is_namespace_package |= other.is_namespace_package;
+        if let Some(value) = other.in_memory_source {
+            self.in_memory_source.replace(value);
+        }
+        if let Some(value) = other.in_memory_bytecode {
+            self.in_memory_bytecode.replace(value);
+        }
+        if let Some(value) = other.in_memory_bytecode_opt1 {
+            self.in_memory_bytecode_opt1.replace(value);
+        }
+        if let Some(value) = other.in_memory_bytecode_opt2 {
+            self.in_memory_bytecode_opt2.replace(value);
+        }
+        if let Some(value) = other.in_memory_extension_module_shared_library {
+            self.in_memory_extension_module_shared_library
+                .replace(value);
+        }
+        if let Some(value) = other.in_memory_package_resources {
+            self.in_memory_package_resources.replace(value);
+        }
+        if let Some(value) = other.in_memory_distribution_resources {
+            self.in_memory_distribution_resources.replace(value);
+        }
+        if let Some(value) = other.in_memory_shared_library {
+            self.in_memory_shared_library.replace(value);
+        }
+        if let Some(value) = other.shared_library_dependency_names {
+            self.shared_library_dependency_names.replace(value);
+        }
+        if let Some(value) = other.relative_path_module_source {
+            self.relative_path_module_source.replace(value);
+        }
+        if let Some(value) = other.relative_path_module_bytecode {
+            self.relative_path_module_bytecode.replace(value);
+        }
+        if let Some(value) = other.relative_path_module_bytecode_opt1 {
+            self.relative_path_module_bytecode_opt1.replace(value);
+        }
+        if let Some(value) = other.relative_path_module_bytecode_opt2 {
+            self.relative_path_module_bytecode_opt2.replace(value);
+        }
+        if let Some(value) = other.relative_path_extension_module_shared_library {
+            self.relative_path_extension_module_shared_library
+                .replace(value);
+        }
+        if let Some(value) = other.relative_path_package_resources {
+            self.relative_path_package_resources.replace(value);
+        }
+        if let Some(value) = other.relative_path_distribution_resources {
+            self.relative_path_distribution_resources.replace(value);
+        }
+        // TODO we should probably store an Option<bool> here so this assignment is
+        // unambiguous.
+        self.file_executable |= other.file_executable;
+        if let Some(value) = other.file_data_embedded {
+            self.file_data_embedded.replace(value);
+        }
+        if let Some(value) = other.file_data_utf8_relative_path {
+            self.file_data_utf8_relative_path.replace(value);
+        }
+
+        Ok(())
+    }
+
     pub fn to_owned(&self) -> Resource<'static, X> {
         Resource {
             flavor: self.flavor,
@@ -438,21 +517,27 @@ where
                 .as_ref()
                 .map(|value| Cow::Owned(value.clone().into_owned())),
             in_memory_package_resources: self.in_memory_package_resources.as_ref().map(|value| {
-                HashMap::from_iter(value.iter().map(|(k, v)| {
-                    (
-                        Cow::Owned(k.clone().into_owned()),
-                        Cow::Owned(v.clone().into_owned()),
-                    )
-                }))
-            }),
-            in_memory_distribution_resources: self.in_memory_distribution_resources.as_ref().map(
-                |value| {
-                    HashMap::from_iter(value.iter().map(|(k, v)| {
+                value
+                    .iter()
+                    .map(|(k, v)| {
                         (
                             Cow::Owned(k.clone().into_owned()),
                             Cow::Owned(v.clone().into_owned()),
                         )
-                    }))
+                    })
+                    .collect()
+            }),
+            in_memory_distribution_resources: self.in_memory_distribution_resources.as_ref().map(
+                |value| {
+                    value
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                Cow::Owned(k.clone().into_owned()),
+                                Cow::Owned(v.clone().into_owned()),
+                            )
+                        })
+                        .collect()
                 },
             ),
             in_memory_shared_library: self
@@ -460,7 +545,12 @@ where
                 .as_ref()
                 .map(|value| Cow::Owned(value.clone().into_owned())),
             shared_library_dependency_names: self.shared_library_dependency_names.as_ref().map(
-                |value| Vec::from_iter(value.iter().map(|x| Cow::Owned(x.clone().into_owned()))),
+                |value| {
+                    value
+                        .iter()
+                        .map(|x| Cow::Owned(x.clone().into_owned()))
+                        .collect()
+                },
             ),
             relative_path_module_source: self
                 .relative_path_module_source
@@ -484,24 +574,30 @@ where
                 .map(|value| Cow::Owned(value.clone().into_owned())),
             relative_path_package_resources: self.relative_path_package_resources.as_ref().map(
                 |value| {
-                    HashMap::from_iter(value.iter().map(|(k, v)| {
-                        (
-                            Cow::Owned(k.clone().into_owned()),
-                            Cow::Owned(v.clone().into_owned()),
-                        )
-                    }))
+                    value
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                Cow::Owned(k.clone().into_owned()),
+                                Cow::Owned(v.clone().into_owned()),
+                            )
+                        })
+                        .collect()
                 },
             ),
             relative_path_distribution_resources: self
                 .relative_path_distribution_resources
                 .as_ref()
                 .map(|value| {
-                    HashMap::from_iter(value.iter().map(|(k, v)| {
-                        (
-                            Cow::Owned(k.clone().into_owned()),
-                            Cow::Owned(v.clone().into_owned()),
-                        )
-                    }))
+                    value
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                Cow::Owned(k.clone().into_owned()),
+                                Cow::Owned(v.clone().into_owned()),
+                            )
+                        })
+                        .collect()
                 }),
             file_executable: self.file_executable,
             file_data_embedded: self

@@ -7,7 +7,7 @@ use {
     python_packaging::{
         location::ConcreteResourceLocation,
         resource::{
-            FileData, PythonExtensionModule, PythonModuleSource, PythonPackageDistributionResource,
+            PythonExtensionModule, PythonModuleSource, PythonPackageDistributionResource,
             PythonPackageResource, PythonResource,
         },
         resource_collection::PythonResourceAddCollectionContext,
@@ -24,6 +24,7 @@ use {
         },
     },
     std::convert::{TryFrom, TryInto},
+    tugger_file_manifest::File,
 };
 
 #[derive(Clone, Debug)]
@@ -90,9 +91,9 @@ impl TryFrom<&Value> for OptionalResourceLocation {
     }
 }
 
-impl Into<Option<ConcreteResourceLocation>> for OptionalResourceLocation {
-    fn into(self) -> Option<ConcreteResourceLocation> {
-        self.inner
+impl From<OptionalResourceLocation> for Option<ConcreteResourceLocation> {
+    fn from(location: OptionalResourceLocation) -> Self {
+        location.inner
     }
 }
 
@@ -594,15 +595,15 @@ impl TypedValue for PythonExtensionModuleValue {
     }
 }
 
-/// Starlark value wrapper for `FileData`.
+/// Starlark value wrapper for `File`.
 #[derive(Clone, Debug)]
 pub struct FileValue {
-    pub inner: FileData,
+    pub inner: File,
     pub add_context: Option<PythonResourceAddCollectionContext>,
 }
 
 impl FileValue {
-    pub fn new(file: FileData) -> Self {
+    pub fn new(file: File) -> Self {
         Self {
             inner: file,
             add_context: None,
@@ -637,7 +638,7 @@ impl TypedValue for FileValue {
             "{}<path={}, is_executable={}>",
             Self::TYPE,
             self.inner.path_string(),
-            self.inner.is_executable
+            self.inner.entry.executable
         )
     }
 
@@ -648,7 +649,7 @@ impl TypedValue for FileValue {
     fn get_attr(&self, attribute: &str) -> ValueResult {
         let v = match attribute {
             "path" => Value::from(self.inner.path_string()),
-            "is_executable" => Value::from(self.inner.is_executable),
+            "is_executable" => Value::from(self.inner.entry.executable),
             attr => {
                 return if self.add_collection_context_attrs().contains(&attr) {
                     self.get_attr_add_collection_context(attr)
@@ -723,10 +724,10 @@ pub fn python_resource_to_value(
 
         PythonResource::ExtensionModule(em) => {
             let mut em = PythonExtensionModuleValue::new(em.clone().into_owned());
-            policy.apply_to_resource(type_values, call_stack,&mut em)?;
+            policy.apply_to_resource(type_values, call_stack, &mut em)?;
 
             Ok(Value::new(em))
-        },
+        }
 
         PythonResource::File(f) => {
             let mut value = FileValue::new(f.clone().into_owned());
@@ -789,7 +790,8 @@ mod tests {
 
     #[test]
     fn test_source_module_attrs() -> Result<()> {
-        let mut env = StarlarkEnvironment::new_with_exe()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
+        add_exe(&mut env)?;
 
         let dist_value = env.eval("dist")?;
         let dist_ref = dist_value

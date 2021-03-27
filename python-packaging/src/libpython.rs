@@ -5,11 +5,12 @@
 /*! Functionality for building a library containing Python */
 
 use {
-    crate::{licensing::LicenseInfo, resource::DataLocation},
     std::{
         collections::{BTreeMap, BTreeSet},
         path::PathBuf,
     },
+    tugger_file_manifest::FileData,
+    tugger_licensing::LicensedComponents,
 };
 
 /// Holds state necessary to build and link a libpython.
@@ -24,10 +25,10 @@ pub struct LibPythonBuildContext {
     /// Include files defining Python headers.
     ///
     /// These are necessary to compile code that references Python types.
-    pub includes: BTreeMap<PathBuf, DataLocation>,
+    pub includes: BTreeMap<PathBuf, FileData>,
 
     /// Object files that will be linked together.
-    pub object_files: Vec<DataLocation>,
+    pub object_files: Vec<FileData>,
 
     /// Filesystem paths to add to linker search path.
     pub library_search_paths: BTreeSet<PathBuf>,
@@ -53,10 +54,7 @@ pub struct LibPythonBuildContext {
     pub init_functions: BTreeMap<String, String>,
 
     /// Holds licensing info for things being linked together.
-    ///
-    /// Keys are entity name (e.g. extension name). Values are license
-    /// structures.
-    pub license_infos: BTreeMap<String, Vec<LicenseInfo>>,
+    pub licensed_components: LicensedComponents,
 }
 
 impl Default for LibPythonBuildContext {
@@ -71,7 +69,7 @@ impl Default for LibPythonBuildContext {
             static_libraries: BTreeSet::new(),
             frameworks: BTreeSet::new(),
             init_functions: BTreeMap::new(),
-            license_infos: BTreeMap::new(),
+            licensed_components: LicensedComponents::default(),
         }
     }
 }
@@ -88,7 +86,7 @@ impl LibPythonBuildContext {
         let mut static_libraries = BTreeSet::new();
         let mut frameworks = BTreeSet::new();
         let mut init_functions = BTreeMap::new();
-        let mut license_infos = BTreeMap::new();
+        let mut licensed_components = LicensedComponents::default();
 
         for context in contexts {
             // Last write wins.
@@ -119,8 +117,8 @@ impl LibPythonBuildContext {
             for (k, v) in &context.init_functions {
                 init_functions.insert(k.clone(), v.clone());
             }
-            for (k, v) in &context.license_infos {
-                license_infos.insert(k.clone(), v.clone());
+            for c in context.licensed_components.iter_components() {
+                licensed_components.add_component(c.clone());
             }
         }
 
@@ -134,7 +132,7 @@ impl LibPythonBuildContext {
             static_libraries,
             frameworks,
             init_functions,
-            license_infos,
+            licensed_components,
         }
     }
 }

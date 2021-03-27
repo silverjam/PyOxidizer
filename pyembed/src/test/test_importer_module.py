@@ -2,7 +2,6 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import sys
 import unittest
 
 
@@ -16,6 +15,7 @@ class TestImporterModule(unittest.TestCase):
             {
                 "decode_source",
                 "find_resources_in_path",
+                "OxidizedDistribution",
                 "OxidizedFinder",
                 "OxidizedResourceCollector",
                 "OxidizedResourceReader",
@@ -47,6 +47,11 @@ class TestImporterModule(unittest.TestCase):
                 "get_filename",
                 "get_resource_reader",
                 "get_source",
+                "index_bytes",
+                "index_file_memory_mapped",
+                "index_interpreter_builtins",
+                "index_interpreter_builtin_extension_modules",
+                "index_interpreter_frozen_modules",
                 "indexed_resources",
                 "invalidate_caches",
                 "iter_modules",
@@ -56,4 +61,4 @@ class TestImporterModule(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(exit=False)
+    unittest.main()

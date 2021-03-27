@@ -3,10 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use {
-    super::{
-        python_resource::ResourceCollectionContext,
-        util::{required_str_arg, required_type_arg},
-    },
+    super::python_resource::ResourceCollectionContext,
     linked_hash_map::LinkedHashMap,
     python_packaging::{
         location::ConcreteResourceLocation,
@@ -23,6 +20,7 @@ use {
             Mutable, TypedValue, Value, ValueResult,
         },
     },
+    starlark_dialect_build_targets::required_type_arg,
     std::convert::TryFrom,
     std::ops::Deref,
 };
@@ -155,26 +153,26 @@ impl TypedValue for PythonPackagingPolicyValue {
     }
 
     fn has_attr(&self, attribute: &str) -> Result<bool, ValueError> {
-        Ok(match attribute {
-            "allow_files" => true,
-            "allow_in_memory_shared_library_loading" => true,
-            "bytecode_optimize_level_zero" => true,
-            "bytecode_optimize_level_one" => true,
-            "bytecode_optimize_level_two" => true,
-            "extension_module_filter" => true,
-            "file_scanner_classify_files" => true,
-            "file_scanner_emit_files" => true,
-            "include_distribution_sources" => true,
-            "include_distribution_resources" => true,
-            "include_classified_resources" => true,
-            "include_file_resources" => true,
-            "include_non_distribution_sources" => true,
-            "include_test" => true,
-            "preferred_extension_module_variants" => true,
-            "resources_location" => true,
-            "resources_location_fallback" => true,
-            _ => false,
-        })
+        Ok(matches!(
+            attribute,
+            "allow_files"
+                | "allow_in_memory_shared_library_loading"
+                | "bytecode_optimize_level_zero"
+                | "bytecode_optimize_level_one"
+                | "bytecode_optimize_level_two"
+                | "extension_module_filter"
+                | "file_scanner_classify_files"
+                | "file_scanner_emit_files"
+                | "include_distribution_sources"
+                | "include_distribution_resources"
+                | "include_classified_resources"
+                | "include_file_resources"
+                | "include_non_distribution_sources"
+                | "include_test"
+                | "preferred_extension_module_variants"
+                | "resources_location"
+                | "resources_location_fallback"
+        ))
     }
 
     fn set_attr(&mut self, attribute: &str, value: Value) -> Result<(), ValueError> {
@@ -296,23 +294,19 @@ impl PythonPackagingPolicyValue {
         Ok(Value::from(NoneType::None))
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn starlark_set_preferred_extension_module_variant(
         &mut self,
-        name: &Value,
-        value: &Value,
+        name: String,
+        value: String,
     ) -> ValueResult {
-        let name = required_str_arg("name", name)?;
-        let value = required_str_arg("value", value)?;
-
         self.inner
             .set_preferred_extension_module_variant(&name, &value);
 
         Ok(Value::from(NoneType::None))
     }
 
-    fn starlark_set_resource_handling_mode(&mut self, value: &Value) -> ValueResult {
-        let value = required_str_arg("mode", value)?;
-
+    fn starlark_set_resource_handling_mode(&mut self, value: String) -> ValueResult {
         let mode = ResourceHandlingMode::try_from(value.as_str()).map_err(|e| {
             ValueError::from(RuntimeError {
                 code: "PYOXIDIZER_BUILD",
@@ -329,24 +323,22 @@ impl PythonPackagingPolicyValue {
 
 starlark_module! { python_packaging_policy_module =>
     PythonPackagingPolicy.register_resource_callback(this, func) {
-        match this.clone().downcast_mut::<PythonPackagingPolicyValue>()? {
-            Some(mut policy) => policy.starlark_register_resource_callback(&func),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+        let mut this = this.downcast_mut::<PythonPackagingPolicyValue>().unwrap().unwrap();
+        this.starlark_register_resource_callback(&func)
     }
 
-    PythonPackagingPolicy.set_preferred_extension_module_variant(this, name, value) {
-        match this.clone().downcast_mut::<PythonPackagingPolicyValue>()? {
-            Some(mut policy) => policy.starlark_set_preferred_extension_module_variant(&name, &value),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+    PythonPackagingPolicy.set_preferred_extension_module_variant(
+        this,
+        name: String,
+        value: String
+    ) {
+        let mut this = this.downcast_mut::<PythonPackagingPolicyValue>().unwrap().unwrap();
+        this.starlark_set_preferred_extension_module_variant(name, value)
     }
 
-    PythonPackagingPolicy.set_resource_handling_mode(this, mode) {
-        match this.clone().downcast_mut::<PythonPackagingPolicyValue>()? {
-            Some(mut policy) => policy.starlark_set_resource_handling_mode(&mode),
-            None => Err(ValueError::IncorrectParameterType),
-        }
+    PythonPackagingPolicy.set_resource_handling_mode(this, mode: String) {
+        let mut this = this.downcast_mut::<PythonPackagingPolicyValue>().unwrap().unwrap();
+        this.starlark_set_resource_handling_mode(mode)
     }
 }
 
@@ -359,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_basic() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         env.eval("dist = default_python_distribution()")?;
         env.eval("policy = dist.make_python_packaging_policy()")?;
@@ -575,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_preferred_extension_module_variants() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         env.eval("dist = default_python_distribution()")?;
         env.eval("policy = dist.make_python_packaging_policy()")?;
@@ -596,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_register_resource_callback() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         env.eval("dist = default_python_distribution()")?;
         env.eval("policy = dist.make_python_packaging_policy()")?;
@@ -619,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_set_resource_handling_mode() -> Result<()> {
-        let mut env = StarlarkEnvironment::new()?;
+        let mut env = test_evaluation_context_builder()?.into_context()?;
 
         env.eval("dist = default_python_distribution()")?;
         env.eval("policy = dist.make_python_packaging_policy()")?;

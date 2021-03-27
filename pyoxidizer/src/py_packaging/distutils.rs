@@ -8,8 +8,8 @@ Interacting with distutils.
 
 use {
     anyhow::{Context, Result},
-    lazy_static::lazy_static,
-    python_packaging::resource::{DataLocation, LibraryDependency, PythonExtensionModule},
+    once_cell::sync::Lazy,
+    python_packaging::resource::{LibraryDependency, PythonExtensionModule},
     serde::Deserialize,
     slog::warn,
     std::{
@@ -17,28 +17,27 @@ use {
         fs::{create_dir_all, read_dir, read_to_string},
         path::{Path, PathBuf},
     },
+    tugger_file_manifest::FileData,
 };
 
-lazy_static! {
-    static ref MODIFIED_DISTUTILS_FILES: BTreeMap<&'static str, &'static [u8]> = {
-        let mut res: BTreeMap<&'static str, &'static [u8]> = BTreeMap::new();
+static MODIFIED_DISTUTILS_FILES: Lazy<BTreeMap<&'static str, &'static [u8]>> = Lazy::new(|| {
+    let mut res: BTreeMap<&'static str, &'static [u8]> = BTreeMap::new();
 
-        res.insert(
-            "command/build_ext.py",
-            include_bytes!("../distutils/command/build_ext.py"),
-        );
-        res.insert(
-            "_msvccompiler.py",
-            include_bytes!("../distutils/_msvccompiler.py"),
-        );
-        res.insert(
-            "unixccompiler.py",
-            include_bytes!("../distutils/unixccompiler.py"),
-        );
+    res.insert(
+        "command/build_ext.py",
+        include_bytes!("../distutils/command/build_ext.py"),
+    );
+    res.insert(
+        "_msvccompiler.py",
+        include_bytes!("../distutils/_msvccompiler.py"),
+    );
+    res.insert(
+        "unixccompiler.py",
+        include_bytes!("../distutils/unixccompiler.py"),
+    );
 
-        res
-    };
-}
+    res
+});
 
 /// Prepare a hacked install of distutils to use with Python packaging.
 ///
@@ -168,7 +167,7 @@ pub fn read_built_extensions(state_dir: &Path) -> Result<Vec<PythonExtensionModu
 
         // Extension files may not always be written. So ignore errors on missing file.
         let extension_data = if let Ok(data) = std::fs::read(&extension_path) {
-            Some(DataLocation::Memory(data))
+            Some(FileData::Memory(data))
         } else {
             None
         };
@@ -179,7 +178,7 @@ pub fn read_built_extensions(state_dir: &Path) -> Result<Vec<PythonExtensionModu
             let path = PathBuf::from(object_path);
             let data = std::fs::read(&path).context(format!("reading {}", path.display()))?;
 
-            object_file_data.push(DataLocation::Memory(data));
+            object_file_data.push(FileData::Memory(data));
         }
 
         let link_libraries = info
@@ -212,8 +211,7 @@ pub fn read_built_extensions(state_dir: &Path) -> Result<Vec<PythonExtensionModu
             builtin_default: false,
             required: false,
             variant: None,
-            licenses: None,
-            license_public_domain: None,
+            license: None,
         });
     }
 

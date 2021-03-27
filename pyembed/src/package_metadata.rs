@@ -3,23 +3,48 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use {
-    super::importer::ImporterState,
-    cpython::exc::{IOError, NotImplementedError},
+    crate::importer::ImporterState,
     cpython::{
-        py_class, NoArgs, ObjectProtocol, PyBytes, PyErr, PyList, PyObject, PyResult, PyString,
-        Python, PythonObject, ToPyObject,
+        exc::{IOError, NotImplementedError, ValueError},
+        py_class, NoArgs, ObjectProtocol, PyBytes, PyClone, PyDict, PyErr, PyList, PyModule,
+        PyObject, PyResult, PyString, PyType, Python, PythonObject, ToPyObject,
     },
     python_packed_resources::data::Resource,
-    std::borrow::Cow,
-    std::collections::HashMap,
-    std::path::Path,
-    std::sync::Arc,
+    std::{borrow::Cow, collections::HashMap, path::Path, sync::Arc},
 };
+
+// Emulates importlib.metadata.Distribution._discover_resolvers().
+fn discover_resolvers(py: Python) -> PyResult<PyList> {
+    let sys_module = py.import("sys")?;
+    let meta_path = sys_module.get(py, "meta_path")?.cast_into::<PyList>(py)?;
+
+    let mut resolvers = vec![];
+
+    for finder in meta_path.iter(py) {
+        if let Ok(find_distributions) = finder.getattr(py, "find_distributions") {
+            if find_distributions != py.None() {
+                resolvers.push(find_distributions);
+            }
+        }
+    }
+
+    Ok(resolvers.into_py_object(py))
+}
 
 // A importlib.metadata.Distribution allowing access to package distribution data.
 py_class!(class OxidizedDistribution |py| {
     data state: Arc<ImporterState>;
     data package: String;
+
+    @classmethod
+    def from_name(cls, name: &PyString) -> PyResult<PyObject> {
+        OxidizedDistribution::from_name_impl(py, cls, name)
+    }
+
+    @classmethod
+    def discover(cls, *args, **kwargs) -> PyResult<PyObject> {
+        OxidizedDistribution::discover_impl(py, cls, kwargs)
+    }
 
     def read_text(&self, filename: &PyString) -> PyResult<PyObject> {
         self.read_text_impl(py, filename)
@@ -47,6 +72,81 @@ py_class!(class OxidizedDistribution |py| {
 });
 
 impl OxidizedDistribution {
+    fn from_name_impl(py: Python, _cls: &PyType, name: &PyString) -> PyResult<PyObject> {
+        let importlib_metadata = py.import("importlib.metadata")?;
+        let finder = importlib_metadata.get(py, "DistributionFinder")?;
+        let context_type = finder.getattr(py, "Context")?;
+
+        for resolver in discover_resolvers(py)?.iter(py) {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item(py, "name", name)?;
+            let context = context_type.call(py, NoArgs, Some(&kwargs))?;
+
+            let dists = resolver.call(py, (context,), None)?;
+
+            let mut it = dists.iter(py)?;
+
+            if let Some(dist) = it.next() {
+                let dist = dist?;
+
+                return Ok(dist);
+            }
+        }
+
+        let package_not_found_error = importlib_metadata.get(py, "PackageNotFoundError")?;
+
+        Err(PyErr::from_instance(
+            py,
+            package_not_found_error.call(py, (name,), None)?,
+        ))
+    }
+
+    fn discover_impl(py: Python, _cls: &PyType, kwargs: Option<&PyDict>) -> PyResult<PyObject> {
+        let importlib_metadata = py.import("importlib.metadata")?;
+        let distribution_finder = importlib_metadata.get(py, "DistributionFinder")?;
+        let context_type = distribution_finder.getattr(py, "Context")?;
+
+        let context = if let Some(kwargs) = kwargs {
+            let context =
+                kwargs
+                    .as_object()
+                    .call_method(py, "pop", ("context", py.None()), None)?;
+
+            if context != py.None() && kwargs.len(py) > 0 {
+                return Err(PyErr::new::<ValueError, _>(
+                    py,
+                    "cannot accept context and kwargs",
+                ));
+            }
+
+            if context == py.None() {
+                context_type.call(py, NoArgs, Some(kwargs))?
+            } else {
+                context
+            }
+        } else {
+            context_type.call(py, NoArgs, None)?
+        };
+
+        let mut distributions = vec![];
+
+        for resolver in discover_resolvers(py)?.iter(py) {
+            for distribution in resolver
+                .call(py, (context.clone_ref(py),), None)?
+                .iter(py)?
+            {
+                distributions.push(distribution?);
+            }
+        }
+
+        // Return an iterator for compatibility with older standard library
+        // versions.
+        Ok(PyList::new(py, &distributions)
+            .into_object()
+            .iter(py)?
+            .into_object())
+    }
+
     fn read_text_impl(&self, py: Python, filename: &PyString) -> PyResult<PyObject> {
         let state: &Arc<ImporterState> = self.state(py);
         let package: &str = self.package(py);
@@ -221,7 +321,10 @@ pub(crate) fn find_distributions(
         distributions
     };
 
-    Ok(PyList::new(py, &distributions).into_object())
+    Ok(PyList::new(py, &distributions)
+        .into_object()
+        .iter(py)?
+        .into_object())
 }
 
 fn resolve_package_distribution_resource<'a>(
@@ -250,4 +353,14 @@ fn resolve_package_distribution_resource<'a>(
     } else {
         Ok(None)
     }
+}
+
+pub(crate) fn module_init(py: Python, m: &PyModule) -> PyResult<()> {
+    m.add(
+        py,
+        "OxidizedDistribution",
+        py.get_type::<crate::package_metadata::OxidizedDistribution>(),
+    )?;
+
+    Ok(())
 }

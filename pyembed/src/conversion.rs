@@ -5,20 +5,24 @@
 //! Bridge Rust and Python string types.
 
 use {
-    cpython::buffer::PyBuffer,
-    cpython::exc::UnicodeDecodeError,
-    cpython::{PyDict, PyErr, PyObject, PyResult, Python},
+    cpython::{
+        buffer::PyBuffer,
+        exc::UnicodeDecodeError,
+        {PyDict, PyErr, PyObject, PyResult, Python},
+    },
     python3_sys as pyffi,
-    std::collections::HashMap,
-    std::ffi::{CStr, CString, OsStr},
-    std::path::{Path, PathBuf},
+    std::{
+        collections::HashMap,
+        ffi::{CStr, OsStr},
+        path::{Path, PathBuf},
+    },
 };
 
 #[cfg(not(library_mode = "extension"))]
-use std::ffi::{NulError, OsString};
+use std::ffi::OsString;
 
 #[cfg(target_family = "unix")]
-use std::os::unix::ffi::OsStrExt;
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 #[cfg(target_family = "windows")]
 use std::os::windows::prelude::OsStrExt;
@@ -97,17 +101,6 @@ pub fn osstring_to_bytes(py: Python, s: OsString) -> PyObject {
         let o = pyffi::PyBytes_FromStringAndSize(w.as_ptr() as *const i8, w.len() as isize * 2);
         PyObject::from_owned_ptr(py, o)
     }
-}
-
-#[cfg(all(unix, not(library_mode = "extension")))]
-pub fn path_to_cstring(path: &Path) -> Result<CString, NulError> {
-    CString::new(path.as_os_str().as_bytes())
-}
-
-#[cfg(all(windows, not(library_mode = "extension")))]
-pub fn path_to_cstring(path: &Path) -> Result<CString, NulError> {
-    // This is not ideal...
-    CString::new(path.to_string_lossy().as_bytes())
 }
 
 pub fn path_to_pyobject(py: Python, path: &Path) -> PyResult<PyObject> {

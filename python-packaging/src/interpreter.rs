@@ -54,71 +54,6 @@ impl TryFrom<&str> for PythonInterpreterProfile {
     }
 }
 
-/// Defines Python code to run.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PythonRunMode {
-    /// No-op.
-    None,
-    /// Run a Python REPL.
-    Repl,
-    /// Run a Python module as the main module.
-    Module { module: String },
-    /// Evaluate Python code from a string.
-    Eval { code: String },
-    /// Execute Python code in a file.
-    ///
-    /// We define this as a CString because the underlying API wants
-    /// a char* and we want the constructor of this type to worry about
-    /// the type coercion.
-    File { path: PathBuf },
-}
-
-impl ToString for PythonRunMode {
-    fn to_string(&self) -> String {
-        match self {
-            Self::None => "none".to_string(),
-            Self::Repl => "repl".to_string(),
-            Self::Module { module } => format!("module:{}", module),
-            Self::Eval { code } => format!("eval:{}", code),
-            Self::File { path } => format!("file:{}", path.display()),
-        }
-    }
-}
-
-impl TryFrom<&str> for PythonRunMode {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "none" => Ok(Self::None),
-            "repl" => Ok(Self::Repl),
-            value => {
-                let parts = value.splitn(2, ":").collect::<Vec<_>>();
-
-                if parts.len() != 2 {
-                    return Err(format!("{} is not a valid Python run mode", value));
-                }
-
-                let prefix = parts[0];
-                let suffix = parts[1];
-
-                match prefix {
-                    "module" => Ok(Self::Module {
-                        module: suffix.to_string(),
-                    }),
-                    "eval" => Ok(Self::Eval {
-                        code: suffix.to_string(),
-                    }),
-                    "file" => Ok(Self::File {
-                        path: PathBuf::from(suffix),
-                    }),
-                    _ => Err(format!("{} is not a valid Python run mode", value)),
-                }
-            }
-        }
-    }
-}
-
 /// Defines `terminfo`` database resolution semantics.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminfoResolution {
@@ -148,8 +83,7 @@ impl TryFrom<&str> for TerminfoResolution {
             Ok(Self::Dynamic)
         } else if value == "none" {
             Ok(Self::None)
-        } else if value.starts_with("static:") {
-            let suffix = &value[7..];
+        } else if let Some(suffix) = value.strip_prefix("static:") {
             Ok(Self::Static(suffix.to_string()))
         } else {
             Err(format!(
@@ -163,19 +97,35 @@ impl TryFrom<&str> for TerminfoResolution {
 /// Defines a backend for a memory allocator.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MemoryAllocatorBackend {
-    /// The default system allocator.
-    System,
+    /// The default allocator as configured by Python.
+    Default,
     /// Use jemalloc.
     Jemalloc,
+    /// Use Mimalloc.
+    Mimalloc,
+    /// Use Snmalloc.
+    Snmalloc,
     /// Use Rust's global allocator.
     Rust,
+}
+
+impl Default for MemoryAllocatorBackend {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Default
+        } else {
+            Self::Jemalloc
+        }
+    }
 }
 
 impl ToString for MemoryAllocatorBackend {
     fn to_string(&self) -> String {
         match self {
-            Self::System => "system",
+            Self::Default => "default",
             Self::Jemalloc => "jemalloc",
+            Self::Mimalloc => "mimalloc",
+            Self::Snmalloc => "snmalloc",
             Self::Rust => "rust",
         }
         .to_string()
@@ -187,59 +137,12 @@ impl TryFrom<&str> for MemoryAllocatorBackend {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "system" => Ok(Self::System),
+            "default" => Ok(Self::Default),
             "jemalloc" => Ok(Self::Jemalloc),
+            "mimalloc" => Ok(Self::Mimalloc),
+            "snmalloc" => Ok(Self::Snmalloc),
             "rust" => Ok(Self::Rust),
             _ => Err(format!("{} is not a valid memory allocator backend", value)),
-        }
-    }
-}
-
-/// Defines configuration for Python's raw allocator.
-///
-/// This allocator is what Python uses for all memory allocations.
-///
-/// See https://docs.python.org/3/c-api/memory.html for more.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PythonRawAllocator {
-    /// Which allocator backend to use.
-    pub backend: MemoryAllocatorBackend,
-    /// Whether memory debugging should be enabled.
-    pub debug: bool,
-}
-
-impl PythonRawAllocator {
-    pub fn system() -> Self {
-        Self {
-            backend: MemoryAllocatorBackend::System,
-            ..PythonRawAllocator::default()
-        }
-    }
-
-    pub fn jemalloc() -> Self {
-        Self {
-            backend: MemoryAllocatorBackend::Jemalloc,
-            ..PythonRawAllocator::default()
-        }
-    }
-
-    pub fn rust() -> Self {
-        Self {
-            backend: MemoryAllocatorBackend::Rust,
-            ..PythonRawAllocator::default()
-        }
-    }
-}
-
-impl Default for PythonRawAllocator {
-    fn default() -> Self {
-        Self {
-            backend: if cfg!(windows) {
-                MemoryAllocatorBackend::System
-            } else {
-                MemoryAllocatorBackend::Jemalloc
-            },
-            debug: false,
         }
     }
 }
@@ -249,6 +152,7 @@ impl Default for PythonRawAllocator {
 /// See https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.coerce_c_locale.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CoerceCLocale {
+    #[allow(clippy::upper_case_acronyms)]
     LCCtype = 1,
     C = 2,
 }
@@ -321,13 +225,13 @@ impl From<i32> for BytesWarning {
 
 /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.check_hash_pycs_mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CheckHashPYCsMode {
+pub enum CheckHashPycsMode {
     Always,
     Never,
     Default,
 }
 
-impl ToString for CheckHashPYCsMode {
+impl ToString for CheckHashPycsMode {
     fn to_string(&self) -> String {
         match self {
             Self::Always => "always",
@@ -338,7 +242,7 @@ impl ToString for CheckHashPYCsMode {
     }
 }
 
-impl TryFrom<&str> for CheckHashPYCsMode {
+impl TryFrom<&str> for CheckHashPycsMode {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -461,7 +365,7 @@ pub struct PythonInterpreterConfig {
     pub bytes_warning: Option<BytesWarning>,
 
     /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.check_hash_pycs_mode.
-    pub check_hash_pycs_mode: Option<CheckHashPYCsMode>,
+    pub check_hash_pycs_mode: Option<CheckHashPycsMode>,
 
     /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.configure_c_stdio.
     pub configure_c_stdio: Option<bool>,
@@ -543,9 +447,6 @@ pub struct PythonInterpreterConfig {
 
     /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.run_module.
     pub run_module: Option<String>,
-
-    /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.show_alloc_count.
-    pub show_alloc_count: Option<bool>,
 
     /// See https://docs.python.org/3/c-api/init_config.html#c.PyConfig.show_ref_count.
     pub show_ref_count: Option<bool>,

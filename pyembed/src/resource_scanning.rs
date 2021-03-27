@@ -5,16 +5,21 @@
 /*! Functionality for scanning the filesystem for Python resources. */
 
 use {
-    crate::conversion::pyobject_to_pathbuf,
-    crate::python_resource_types::{
-        PythonExtensionModule, PythonModuleBytecode, PythonModuleSource,
-        PythonPackageDistributionResource, PythonPackageResource,
+    crate::{
+        conversion::pyobject_to_pathbuf,
+        python_resource_types::{
+            PythonExtensionModule, PythonModuleBytecode, PythonModuleSource,
+            PythonPackageDistributionResource, PythonPackageResource,
+        },
     },
-    cpython::exc::ValueError,
-    cpython::{ObjectProtocol, PyErr, PyObject, PyResult, Python, PythonObject, ToPyObject},
-    python_packaging::filesystem_scanning::find_python_resources,
-    python_packaging::module_util::PythonModuleSuffixes,
-    python_packaging::resource::PythonResource,
+    cpython::{
+        exc::ValueError, ObjectProtocol, PyErr, PyObject, PyResult, Python, PythonObject,
+        ToPyObject,
+    },
+    python_packaging::{
+        filesystem_scanning::find_python_resources, module_util::PythonModuleSuffixes,
+        resource::PythonResource,
+    },
 };
 
 /// Scans a filesystem path for Python resources and turns them into Python types.
@@ -85,7 +90,10 @@ pub(crate) fn find_resources_in_path(py: Python, path: PyObject) -> PyResult<PyO
             PythonResource::PackageDistributionResource(resource) => res.push(
                 PythonPackageDistributionResource::new(py, resource.into_owned())?.into_object(),
             ),
-            _ => {}
+            PythonResource::ModuleBytecodeRequest(_) => {}
+            PythonResource::EggFile(_) => {}
+            PythonResource::PathExtension(_) => {}
+            PythonResource::File(_) => {}
         }
     }
 

@@ -11,27 +11,30 @@ for importing Python modules from memory.
 
 #[cfg(not(library_mode = "extension"))]
 use cpython::NoArgs;
+#[cfg(windows)]
 use {
-    super::conversion::pyobject_to_pathbuf,
-    super::python_resources::{
-        pyobject_to_resource, resource_to_pyobject, ModuleFlavor, OptimizeLevel, OxidizedResource,
-        PythonResourcesState,
+    crate::memory_dll::{free_library_memory, get_proc_address_memory, load_library_memory},
+    cpython::exc::SystemError,
+    std::ffi::{c_void, CString},
+};
+use {
+    crate::{
+        conversion::pyobject_to_pathbuf,
+        python_resources::{
+            pyobject_to_resource, resource_to_pyobject, ModuleFlavor, OptimizeLevel,
+            OxidizedResource, PythonResourcesState,
+        },
+        resource_scanning::find_resources_in_path,
     },
-    super::resource_scanning::find_resources_in_path,
-    cpython::buffer::PyBuffer,
-    cpython::exc::{FileNotFoundError, IOError, ImportError, ValueError},
     cpython::{
-        py_class, py_fn, ObjectProtocol, PyBytes, PyCapsule, PyClone, PyDict, PyErr, PyList,
-        PyModule, PyObject, PyResult, PyString, PyTuple, Python, PythonObject, ToPyObject,
+        exc::{FileNotFoundError, ImportError, ValueError},
+        {
+            py_class, py_fn, ObjectProtocol, PyBytes, PyCapsule, PyClone, PyDict, PyErr, PyList,
+            PyModule, PyObject, PyResult, PyString, PyTuple, Python, PythonObject, ToPyObject,
+        },
     },
     python3_sys as pyffi,
     std::sync::Arc,
-};
-#[cfg(windows)]
-use {
-    super::memory_dll::{free_library_memory, get_proc_address_memory, load_library_memory},
-    cpython::exc::SystemError,
-    std::ffi::{c_void, CString},
 };
 
 pub const OXIDIZED_IMPORTER_NAME_STR: &str = "oxidized_importer";
@@ -97,11 +100,11 @@ fn extension_module_shared_library_create_module(
     // Any error past this point should call `MemoryFreeLibrary()` to unload the
     // library.
 
-    load_dynamic_library(py, sys_modules, spec, name_py, name, module).or_else(|e| {
+    load_dynamic_library(py, sys_modules, spec, name_py, name, module).map_err(|e| {
         unsafe {
             free_library_memory(module);
         }
-        Err(e)
+        e
     })
 }
 
@@ -163,16 +166,14 @@ fn load_dynamic_library(
         py_module
     };
 
-    if py_module.is_null() {
-        if unsafe { pyffi::PyErr_Occurred().is_null() } {
-            return Err(PyErr::new::<SystemError, _>(
-                py,
-                format!(
-                    "initialization of {} failed without raising an exception",
-                    name
-                ),
-            ));
-        }
+    if py_module.is_null() && unsafe { pyffi::PyErr_Occurred().is_null() } {
+        return Err(PyErr::new::<SystemError, _>(
+            py,
+            format!(
+                "initialization of {} failed without raising an exception",
+                name
+            ),
+        ));
     }
 
     // Cast to owned type to help prevent refcount/memory leaks.
@@ -285,16 +286,6 @@ pub(crate) struct ImporterState {
     /// the backing memory instead of forcing all resource data to be backed
     /// by 'static.
     resources_state: PyCapsule,
-    resources_state_owned: bool,
-
-    /// Python object that was used to supply resources data.
-    _resources_py_object: Option<PyObject>,
-
-    /// Holds a memory mapped file instance that resources data came from.
-    ///
-    /// We need to hold a reference to this instance because resources_state
-    /// was constructed from a &[u8] backed by it.
-    _resources_mmap: Option<Box<memmap::Mmap>>,
 }
 
 impl ImporterState {
@@ -302,10 +293,7 @@ impl ImporterState {
         py: Python,
         importer_module: &PyModule,
         bootstrap_module: &PyModule,
-        resources_state: &'a PythonResourcesState<'a, u8>,
-        resources_state_owned: bool,
-        resources_py_object: Option<PyObject>,
-        resources_mmap: Option<Box<memmap::Mmap>>,
+        resources_state: Box<PythonResourcesState<'a, u8>>,
     ) -> Result<Self, PyErr> {
         let decode_source = importer_module.get(py, "decode_source")?;
 
@@ -376,7 +364,7 @@ impl ImporterState {
 
         let capsule = unsafe {
             let ptr = pyffi::PyCapsule_New(
-                resources_state as *const PythonResourcesState<u8> as *mut _,
+                &*resources_state as *const PythonResourcesState<u8> as *mut _,
                 std::ptr::null(),
                 None,
             );
@@ -391,6 +379,10 @@ impl ImporterState {
             PyObject::from_owned_ptr(py, ptr).unchecked_cast_into()
         };
 
+        // We store a pointer to the heap memory and take care of destroying
+        // it when we are dropped. So we leak the box.
+        Box::leak(resources_state);
+
         Ok(ImporterState {
             imp_module,
             sys_module,
@@ -404,9 +396,6 @@ impl ImporterState {
             exec_fn,
             optimize_level,
             resources_state: capsule,
-            resources_state_owned,
-            _resources_py_object: resources_py_object,
-            _resources_mmap: resources_mmap,
         })
     }
 
@@ -444,20 +433,13 @@ impl ImporterState {
 
 impl Drop for ImporterState {
     fn drop(&mut self) {
-        // If we own the PythonResourcesState<u8> encapsulated in a PyCapsule,
-        // cast it back to a Box so it can be dropped.
-        if self.resources_state_owned {
-            let ptr = unsafe {
-                pyffi::PyCapsule_GetPointer(
-                    self.resources_state.as_object().as_ptr(),
-                    std::ptr::null(),
-                )
-            };
+        let ptr = unsafe {
+            pyffi::PyCapsule_GetPointer(self.resources_state.as_object().as_ptr(), std::ptr::null())
+        };
 
-            if !ptr.is_null() {
-                unsafe {
-                    Box::from_raw(ptr as *mut PythonResourcesState<u8>);
-                }
+        if !ptr.is_null() {
+            unsafe {
+                Box::from_raw(ptr as *mut PythonResourcesState<u8>);
             }
         }
     }
@@ -547,8 +529,28 @@ py_class!(class OxidizedFinder |py| {
     }
 
     // Additional methods provided for convenience.
-    def __new__(_cls, resources_data: Option<PyObject> = None, resources_file: Option<PyObject> = None, relative_path_origin: Option<PyObject> = None) -> PyResult<OxidizedFinder> {
-        oxidized_finder_new(py, resources_data, resources_file, relative_path_origin)
+    def __new__(_cls, relative_path_origin: Option<PyObject> = None) -> PyResult<OxidizedFinder> {
+        oxidized_finder_new(py, relative_path_origin)
+    }
+
+    def index_bytes(&self, data: PyObject) -> PyResult<PyObject> {
+        self.index_bytes_impl(py, data)
+    }
+
+    def index_file_memory_mapped(&self, path: PyObject) -> PyResult<PyObject> {
+        self.index_file_memory_mapped_impl(py, path)
+    }
+
+    def index_interpreter_builtins(&self) -> PyResult<PyObject> {
+        self.index_interpreter_builtins_impl(py)
+    }
+
+    def index_interpreter_builtin_extension_modules(&self) -> PyResult<PyObject> {
+        self.index_interpreter_builtin_extension_modules_impl(py)
+    }
+
+    def index_interpreter_frozen_modules(&self) -> PyResult<PyObject> {
+        self.index_interpreter_frozen_modules_impl(py)
     }
 
     def indexed_resources(&self) -> PyResult<PyObject> {
@@ -872,16 +874,21 @@ impl OxidizedFinder {
         let state = self.state(py);
 
         let (path, name) = if let Some(context) = context {
-            // The passed object should have `path` and `name` attributes.
+            // The passed object should have `path` and `name` attributes. But the
+            // values could be `None`, so normalize those to Rust's `None`.
             let path = context.getattr(py, "path")?;
+            let path = if path == py.None() { None } else { Some(path) };
+
             let name = context.getattr(py, "name")?;
-            (Some(path), Some(name))
+            let name = if name == py.None() { None } else { Some(name) };
+
+            (path, name)
         } else {
             // No argument = default Context = find everything.
             (None, None)
         };
 
-        super::package_metadata::find_distributions(py, state.clone(), path, name)
+        crate::package_metadata::find_distributions(py, state.clone(), name, path)
     }
 }
 
@@ -908,7 +915,7 @@ impl OxidizedFinder {
     fn new_from_module_and_resources<'a>(
         py: Python,
         m: &PyModule,
-        resources_state: &PythonResourcesState<'a, u8>,
+        resources_state: Box<PythonResourcesState<'a, u8>>,
     ) -> PyResult<OxidizedFinder> {
         let bootstrap_module = py.import("_frozen_importlib")?;
 
@@ -919,9 +926,6 @@ impl OxidizedFinder {
                 &m,
                 &bootstrap_module,
                 resources_state,
-                false,
-                None,
-                None,
             )?),
         )?;
 
@@ -929,11 +933,9 @@ impl OxidizedFinder {
     }
 }
 
-/// OxidizedFinder.__new__(resources_data=None)
+/// OxidizedFinder.__new__(relative_path_origin=None))
 fn oxidized_finder_new(
     py: Python,
-    resources_data: Option<PyObject>,
-    resources_file: Option<PyObject>,
     relative_path_origin: Option<PyObject>,
 ) -> PyResult<OxidizedFinder> {
     // We need to obtain an ImporterState instance. This requires handles on a
@@ -943,23 +945,6 @@ fn oxidized_finder_new(
     let m = py.import(OXIDIZED_IMPORTER_NAME_STR)?;
     let bootstrap_module = py.import("_frozen_importlib")?;
 
-    // The PythonResourcesState is a bit more complex.
-    //
-    // It loads resources data from a memory location and stores references
-    // to that memory address. That means resources data passed in must live
-    // for at least as long as the PythonResourcesState / ImporterState /
-    // OxidizedFinder instances or else we could have an unsafety issue.
-    //
-    // To make matters more complex, ImporterState stores the reference to
-    // PythonResourcesState as a PyCapsule to avoid 'static lifetime restrictions.
-    //
-    // Our solution to this predicament is to stash a reference to the
-    // PyObject holding the resources data and an opaque object holding
-    // our PythonResourcesState on the returned instance. This ensures that
-    // the memory backing this finder instance lives at least as long as the
-    // finder itself.
-
-    // It needs to live on the heap to ensure that the memory address is constant.
     let mut resources_state = Box::new(
         PythonResourcesState::new_from_env().map_err(|err| PyErr::new::<ValueError, _>(py, err))?,
     );
@@ -969,62 +954,70 @@ fn oxidized_finder_new(
         resources_state.origin = pyobject_to_pathbuf(py, py_origin)?;
     }
 
-    // If we received a PyObject defining resources data, try to resolve it.
-    let (raw_resource_datas, mapped) = if let Some(resources) = &resources_data {
-        let buffer = PyBuffer::get(py, resources)?;
-
-        let data = unsafe {
-            std::slice::from_raw_parts::<u8>(buffer.buf_ptr() as *const _, buffer.len_bytes())
-        };
-
-        (vec![data], None)
-    } else if let Some(resources_file) = resources_file {
-        let path = pyobject_to_pathbuf(py, resources_file)?;
-
-        let f = std::fs::File::open(&path).map_err(|e| {
-            PyErr::new::<IOError, _>(py, format!("unable to open resources file: {}", e))
-        })?;
-
-        let mapped = Box::new(unsafe { memmap::Mmap::map(&f) }.map_err(|e| {
-            PyErr::new::<IOError, _>(py, format!("unable to memory map resources file: {}", e))
-        })?);
-
-        // We "leak" a pointer to the memory mapped data and create a slice from it
-        // so we don't have a reference to a borrowed value, which the borrow checker
-        // would complain about. But when we do this, we need to stash the Mmap so it
-        // lives at least as long as this slice.
-        let data = unsafe { std::slice::from_raw_parts::<u8>(mapped.as_ptr(), mapped.len()) };
-
-        (vec![data], Some(mapped))
-    } else {
-        (vec![], None)
-    };
-
-    resources_state
-        .load(&raw_resource_datas)
-        .map_err(|err| PyErr::new::<ValueError, _>(py, err))?;
-
     let importer = OxidizedFinder::create_instance(
         py,
         Arc::new(ImporterState::new(
             py,
             &m,
             &bootstrap_module,
-            &resources_state,
-            true,
-            resources_data,
-            mapped,
+            resources_state,
         )?),
     )?;
-
-    // We effectively transferred ownership of resources_state just above.
-    // So forget about it here.
-    Box::leak(resources_state);
 
     Ok(importer)
 }
 
 impl OxidizedFinder {
+    fn index_bytes_impl(&self, py: Python, data: PyObject) -> PyResult<PyObject> {
+        let resources_state: &mut PythonResourcesState<u8> =
+            self.state(py).get_resources_state_mut();
+        resources_state.index_pyobject(py, data)?;
+
+        Ok(py.None())
+    }
+
+    fn index_file_memory_mapped_impl(&self, py: Python, path: PyObject) -> PyResult<PyObject> {
+        let path = pyobject_to_pathbuf(py, path)?;
+
+        let resources_state: &mut PythonResourcesState<u8> =
+            self.state(py).get_resources_state_mut();
+        resources_state
+            .index_path_memory_mapped(path)
+            .map_err(|e| PyErr::new::<ValueError, _>(py, e))?;
+
+        Ok(py.None())
+    }
+
+    fn index_interpreter_builtins_impl(&self, py: Python) -> PyResult<PyObject> {
+        let resources_state: &mut PythonResourcesState<u8> =
+            self.state(py).get_resources_state_mut();
+        resources_state
+            .index_interpreter_builtins()
+            .map_err(|e| PyErr::new::<ValueError, _>(py, e))?;
+
+        Ok(py.None())
+    }
+
+    fn index_interpreter_builtin_extension_modules_impl(&self, py: Python) -> PyResult<PyObject> {
+        let resources_state: &mut PythonResourcesState<u8> =
+            self.state(py).get_resources_state_mut();
+        resources_state
+            .index_interpreter_builtin_extension_modules()
+            .map_err(|e| PyErr::new::<ValueError, _>(py, e))?;
+
+        Ok(py.None())
+    }
+
+    fn index_interpreter_frozen_modules_impl(&self, py: Python) -> PyResult<PyObject> {
+        let resources_state: &mut PythonResourcesState<u8> =
+            self.state(py).get_resources_state_mut();
+        resources_state
+            .index_interpreter_frozen_modules()
+            .map_err(|e| PyErr::new::<ValueError, _>(py, e))?;
+
+        Ok(py.None())
+    }
+
     fn indexed_resources_impl(&self, py: Python) -> PyResult<PyObject> {
         let resources_state: &PythonResourcesState<u8> = self.state(py).get_resources_state();
 
@@ -1468,19 +1461,21 @@ fn module_init(py: Python, m: &PyModule) -> PyResult<()> {
         py.get_type::<crate::python_resource_types::PythonExtensionModule>(),
     )?;
 
+    crate::package_metadata::module_init(py, m)?;
+
     Ok(())
 }
 
-/// Initialize the module/importer.
+/// Replace all meta path importers with an OxidizedFinder instance.
 ///
 /// This is called after PyInit_* to finish the initialization of the
 /// module. Its state struct is updated. A new instance of the meta path
 /// importer is constructed and registered on sys.meta_path.
 #[cfg(not(library_mode = "extension"))]
-pub(crate) fn initialize_importer<'a>(
+pub(crate) fn replace_meta_path_importers<'a>(
     py: Python,
     m: &PyModule,
-    resources_state: &PythonResourcesState<'a, u8>,
+    resources_state: Box<PythonResourcesState<'a, u8>>,
 ) -> PyResult<()> {
     let mut state = get_module_state(py, m)?;
 

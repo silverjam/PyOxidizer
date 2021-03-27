@@ -6,12 +6,11 @@
 
 use {
     super::resource::BytecodeOptimizationLevel,
-    anyhow::{anyhow, Result},
+    anyhow::{anyhow, Context, Result},
     byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt},
     std::{
-        fs::File,
         io::{BufRead, BufReader, Read, Write},
-        path::{Path, PathBuf},
+        path::Path,
         process,
     },
 };
@@ -36,7 +35,6 @@ pub trait PythonBytecodeCompiler {
 /// An entity to perform Python bytecode compilation.
 #[derive(Debug)]
 pub struct BytecodeCompiler {
-    _temp_dir: tempdir::TempDir,
     command: process::Child,
 
     /// Magic number for bytecode header.
@@ -61,18 +59,20 @@ impl BytecodeCompiler {
     /// object via a pipe, which is used to send bytecode compilation
     /// requests and receive the compiled bytecode. The process is terminated
     /// when this object is dropped.
-    pub fn new(python: &Path) -> Result<BytecodeCompiler> {
-        let temp_dir = tempdir::TempDir::new("bytecode-compiler")?;
-
-        let script_path = PathBuf::from(temp_dir.path()).join("bytecodecompiler.py");
-
-        {
-            let mut fh = File::create(&script_path)?;
-            fh.write_all(BYTECODE_COMPILER)?;
-        }
+    ///
+    /// A Python script is written to the directory passed. This should ideally be
+    /// a temporary directory. The file name is deterministic, so it isn't safe
+    /// for multiple callers to simultaneously pass the same directory. The temporary
+    /// file is deleted before this function returns. Ideally this function would use
+    /// a proper temporary file internally. The reason this isn't done is to avoid
+    /// an extra crate dependency.
+    pub fn new(python: &Path, script_dir: impl AsRef<Path>) -> Result<BytecodeCompiler> {
+        let script_path = script_dir.as_ref().join("bytecode-compiler.py");
+        std::fs::write(&script_path, BYTECODE_COMPILER)
+            .with_context(|| format!("writing Python script to {}", script_path.display()))?;
 
         let mut command = process::Command::new(python)
-            .arg(script_path)
+            .arg(&script_path)
             .stdin(process::Stdio::piped())
             .stdout(process::Stdio::piped())
             .spawn()?;
@@ -80,19 +80,26 @@ impl BytecodeCompiler {
         let stdin = command
             .stdin
             .as_mut()
-            .ok_or_else(|| anyhow!("unable to get stdin"))?;
+            .ok_or_else(|| anyhow!("unable to get stdin"))
+            .context("obtaining stdin")?;
 
-        stdin.write_all(b"magic_number\n")?;
-        stdin.flush()?;
+        stdin
+            .write_all(b"magic_number\n")
+            .context("writing magic_number command request")?;
+        stdin.flush().context("flushing")?;
 
         let stdout = command
             .stdout
             .as_mut()
             .ok_or_else(|| anyhow!("unable to get stdou"))?;
-        let magic_number = stdout.read_u32::<LittleEndian>()?;
+        let magic_number = stdout
+            .read_u32::<LittleEndian>()
+            .context("reading magic number")?;
+
+        std::fs::remove_file(&script_path)
+            .with_context(|| format!("deleting {}", script_path.display()))?;
 
         Ok(BytecodeCompiler {
-            _temp_dir: temp_dir,
             command,
             magic_number,
         })
@@ -116,41 +123,90 @@ impl PythonBytecodeCompiler for BytecodeCompiler {
 
         let mut reader = BufReader::new(stdout);
 
-        stdin.write_all(b"compile\n")?;
-        stdin.write_all(filename.len().to_string().as_bytes())?;
+        stdin
+            .write_all(b"compile\n")
+            .context("writing compile command")?;
+        stdin
+            .write_all(filename.len().to_string().as_bytes())
+            .context("writing filename length")?;
         stdin.write_all(b"\n")?;
-        stdin.write_all(source.len().to_string().as_bytes())?;
+        stdin
+            .write_all(source.len().to_string().as_bytes())
+            .context("writing source code length")?;
         stdin.write_all(b"\n")?;
         stdin.write_all(i32::from(optimize).to_string().as_bytes())?;
         stdin.write_all(b"\n")?;
-        stdin.write_all(match output_mode {
-            CompileMode::Bytecode => b"bytecode",
-            CompileMode::PycCheckedHash => b"pyc-checked-hash",
-            CompileMode::PycUncheckedHash => b"pyc-unchecked-hash",
-        })?;
+        stdin
+            .write_all(match output_mode {
+                CompileMode::Bytecode => b"bytecode",
+                CompileMode::PycCheckedHash => b"pyc-checked-hash",
+                CompileMode::PycUncheckedHash => b"pyc-unchecked-hash",
+            })
+            .context("writing format")?;
         stdin.write_all(b"\n")?;
-        stdin.write_all(filename.as_bytes())?;
-        stdin.write_all(source)?;
-        stdin.flush()?;
+        stdin
+            .write_all(filename.as_bytes())
+            .context("writing filename")?;
+        stdin.write_all(source).context("writing source code")?;
+        stdin.flush().context("flushing")?;
 
-        let mut len_s = String::new();
-        reader.read_line(&mut len_s)?;
+        let mut code_s = String::new();
+        reader
+            .read_line(&mut code_s)
+            .context("reading result code")?;
+        let code_s = code_s.trim_end();
+        let code = code_s.parse::<u8>().unwrap();
 
-        let len_s = len_s.trim_end();
-        let bytecode_len = len_s.parse::<u64>().unwrap();
+        match code {
+            0 => {
+                let mut len_s = String::new();
+                reader
+                    .read_line(&mut len_s)
+                    .context("reading output size line")?;
 
-        let mut bytecode: Vec<u8> = Vec::new();
-        reader.take(bytecode_len).read_to_end(&mut bytecode)?;
+                let len_s = len_s.trim_end();
+                let bytecode_len = len_s.parse::<u64>().unwrap();
 
-        Ok(bytecode)
+                let mut bytecode: Vec<u8> = Vec::new();
+                reader
+                    .take(bytecode_len)
+                    .read_to_end(&mut bytecode)
+                    .context("reading bytecode result")?;
+
+                Ok(bytecode)
+            }
+            1 => {
+                let mut len_s = String::new();
+                reader
+                    .read_line(&mut len_s)
+                    .context("reading error string length line")?;
+
+                let len_s = len_s.trim_end();
+                let error_len = len_s.parse::<u64>().unwrap();
+
+                let mut error_data = vec![];
+                reader
+                    .take(error_len)
+                    .read_to_end(&mut error_data)
+                    .context("reading error message")?;
+
+                Err(anyhow!(
+                    "compiling error: {}",
+                    String::from_utf8(error_data)?
+                ))
+            }
+            _ => Err(anyhow!(
+                "unexpected result code from compile command: {}",
+                code
+            )),
+        }
     }
 }
 
 impl Drop for BytecodeCompiler {
     fn drop(&mut self) {
         let stdin = self.command.stdin.as_mut().expect("failed to get stdin");
-        stdin.write_all(b"exit\n").expect("write failed");
-        stdin.flush().expect("flush failed");
+        let _ = stdin.write_all(b"exit\n").and_then(|()| stdin.flush());
 
         self.command.wait().expect("compiler process did not exit");
     }

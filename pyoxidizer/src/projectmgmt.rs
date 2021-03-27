@@ -5,24 +5,29 @@
 //! Manage PyOxidizer projects.
 
 use {
-    crate::project_building::find_pyoxidizer_config_file_env,
-    crate::project_layout::{initialize_project, write_new_pyoxidizer_config_file},
-    crate::py_packaging::{
-        distribution::{default_distribution_location, resolve_distribution, DistributionFlavor},
-        standalone_distribution::StandaloneDistribution,
+    crate::{
+        project_building::find_pyoxidizer_config_file_env,
+        project_layout::{initialize_project, write_new_pyoxidizer_config_file},
+        py_packaging::{
+            distribution::{
+                default_distribution_location, resolve_distribution,
+                resolve_python_distribution_archive, DistributionFlavor,
+            },
+            standalone_distribution::StandaloneDistribution,
+        },
+        starlark::eval::EvaluationContextBuilder,
     },
-    crate::starlark::eval::{eval_starlark_config_file, EvalResult},
     anyhow::{anyhow, Result},
     python_packaging::{
-        filesystem_scanning::find_python_resources,
-        resource::{DataLocation, PythonResource},
-        wheel::WheelArchive,
+        filesystem_scanning::find_python_resources, resource::PythonResource, wheel::WheelArchive,
     },
     std::{
         fs::create_dir_all,
         io::{Cursor, Read},
-        path::Path,
+        path::{Path, PathBuf},
     },
+    tugger_file_manifest::FileData,
+    tugger_licensing::LicenseFlavor,
 };
 
 /// Attempt to resolve the default Rust target for a build.
@@ -33,7 +38,11 @@ pub fn default_target() -> Result<String> {
     } else if cfg!(target_os = "windows") {
         Ok("x86_64-pc-windows-msvc".to_string())
     } else if cfg!(target_os = "macos") {
-        Ok("x86_64-apple-darwin".to_string())
+        if cfg!(target_arch = "aarch64") {
+            Ok("aarch64-apple-darwin".to_string())
+        } else {
+            Ok("x86_64-apple-darwin".to_string())
+        }
     } else {
         Err(anyhow!("unable to resolve target"))
     }
@@ -56,23 +65,21 @@ pub fn list_targets(logger: &slog::Logger, project_path: &Path) -> Result<()> {
     })?;
 
     let target_triple = default_target()?;
-    let res = eval_starlark_config_file(
-        logger,
-        &config_path,
-        &target_triple,
-        false,
-        false,
-        Some(Vec::new()),
-        false,
-    )?;
 
-    if res.context.default_target.is_none() {
+    let mut context =
+        EvaluationContextBuilder::new(logger.clone(), config_path.clone(), target_triple)
+            .resolve_targets(vec![])
+            .into_context()?;
+
+    context.evaluate_file(&config_path)?;
+
+    if context.default_target()?.is_none() {
         println!("(no targets defined)");
         return Ok(());
     }
 
-    for target in res.context.targets.keys() {
-        let prefix = if Some(target.clone()) == res.context.default_target {
+    for target in context.target_names()? {
+        let prefix = if Some(target.clone()) == context.default_target()? {
             "*"
         } else {
             ""
@@ -103,18 +110,17 @@ pub fn build(
     })?;
     let target_triple = resolve_target(target_triple)?;
 
-    let mut res: EvalResult = eval_starlark_config_file(
-        logger,
-        &config_path,
-        &target_triple,
-        release,
-        verbose,
-        resolve_targets,
-        false,
-    )?;
+    let mut context =
+        EvaluationContextBuilder::new(logger.clone(), config_path.clone(), target_triple)
+            .release(release)
+            .verbose(verbose)
+            .resolve_targets_optional(resolve_targets)
+            .into_context()?;
 
-    for target in res.context.targets_to_resolve() {
-        res.context.build_resolved_target(&target)?;
+    context.evaluate_file(&config_path)?;
+
+    for target in context.targets_to_resolve()? {
+        context.build_resolved_target(&target)?;
     }
 
     Ok(())
@@ -137,23 +143,16 @@ pub fn run(
     })?;
     let target_triple = resolve_target(target_triple)?;
 
-    let resolve_targets = if let Some(target) = target {
-        Some(vec![target.to_string()])
-    } else {
-        None
-    };
+    let mut context =
+        EvaluationContextBuilder::new(logger.clone(), config_path.clone(), target_triple)
+            .release(release)
+            .verbose(verbose)
+            .resolve_target_optional(target)
+            .into_context()?;
 
-    let mut res: EvalResult = eval_starlark_config_file(
-        logger,
-        &config_path,
-        &target_triple,
-        release,
-        verbose,
-        resolve_targets,
-        false,
-    )?;
+    context.evaluate_file(&config_path)?;
 
-    res.context.run_target(target)
+    context.run_target(target)
 }
 
 /// Find resources given a source path.
@@ -174,7 +173,11 @@ pub fn find_resources(
     let extract_path = if let Some(path) = distributions_dir {
         path
     } else {
-        temp_dir.replace(tempdir::TempDir::new("python-distribution")?);
+        temp_dir.replace(
+            tempfile::Builder::new()
+                .prefix("python-distribution")
+                .tempdir()?,
+        );
         temp_dir.as_ref().unwrap().path()
     };
 
@@ -259,15 +262,15 @@ fn print_resource(r: &PythonResource) {
         },
         PythonResource::EggFile(e) => println!(
             "PythonEggFile {{ path: {} }}", match &e.data {
-                DataLocation::Path(p) => p.display().to_string(),
-                DataLocation::Memory(_) => "memory".to_string(),
+                FileData::Path(p) => p.display().to_string(),
+                FileData::Memory(_) => "memory".to_string(),
             }
         ),
         PythonResource::PathExtension(_pe) => println!(
             "PythonPathExtension",
         ),
         PythonResource::File(f) => println!(
-            "File {{ path: {}, is_executable: {} }}", f.path.display(), f.is_executable
+            "File {{ path: {}, is_executable: {} }}", f.path.display(), f.entry.executable
         ),
     }
 }
@@ -314,7 +317,7 @@ pub fn init_rust_project(project_path: &Path) -> Result<()> {
     let env = crate::environment::resolve_environment()?;
     let pyembed_location = env.as_pyembed_location();
 
-    initialize_project(project_path, &pyembed_location, None, &[])?;
+    initialize_project(project_path, &pyembed_location, None, &[], "console")?;
     println!();
     println!(
         "A new Rust binary application has been created in {}",
@@ -335,8 +338,23 @@ pub fn init_rust_project(project_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn python_distribution_extract(dist_path: &str, dest_path: &str) -> Result<()> {
-    let mut fh = std::fs::File::open(Path::new(dist_path))?;
+pub fn python_distribution_extract(
+    download_default: bool,
+    archive_path: Option<&str>,
+    dest_path: &str,
+) -> Result<()> {
+    let dist_path = if let Some(path) = archive_path {
+        PathBuf::from(path)
+    } else if download_default {
+        let location =
+            default_distribution_location(&DistributionFlavor::Standalone, env!("HOST"), None)?;
+
+        resolve_python_distribution_archive(&location, Path::new(dest_path))?
+    } else {
+        return Err(anyhow!("do not know what distribution to operate on"));
+    };
+
+    let mut fh = std::fs::File::open(&dist_path)?;
     let mut data = Vec::new();
     fh.read_to_end(&mut data)?;
     let cursor = Cursor::new(data);
@@ -353,7 +371,9 @@ pub fn python_distribution_info(dist_path: &str) -> Result<()> {
     let fh = std::fs::File::open(Path::new(dist_path))?;
     let reader = std::io::BufReader::new(fh);
 
-    let temp_dir = tempdir::TempDir::new("python-distribution")?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("python-distribution")
+        .tempdir()?;
     let temp_dir_path = temp_dir.path();
 
     let dist = StandaloneDistribution::from_tar_zst(reader, temp_dir_path)?;
@@ -380,10 +400,16 @@ pub fn python_distribution_info(dist_path: &str) -> Result<()> {
             println!();
             println!("Required: {}", em.required);
             println!("Built-in Default: {}", em.builtin_default);
-            if let Some(licenses) = &em.licenses {
+            if let Some(component) = &em.license {
                 println!(
-                    "Licenses: {}",
-                    itertools::join(licenses.iter().flat_map(|l| &l.licenses), ", ")
+                    "Licensing: {}",
+                    match component.license() {
+                        LicenseFlavor::Spdx(expression) => expression.to_string(),
+                        LicenseFlavor::OtherExpression(expression) => expression.to_string(),
+                        LicenseFlavor::PublicDomain => "public domain".to_string(),
+                        LicenseFlavor::None => "none".to_string(),
+                        LicenseFlavor::Unknown(terms) => terms.join(","),
+                    }
                 );
             }
             if !em.link_libraries.is_empty() {
@@ -426,7 +452,9 @@ pub fn python_distribution_licenses(path: &str) -> Result<()> {
     let fh = std::fs::File::open(Path::new(path))?;
     let reader = std::io::BufReader::new(fh);
 
-    let temp_dir = tempdir::TempDir::new("python-distribution")?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("python-distribution")
+        .tempdir()?;
     let temp_dir_path = temp_dir.path();
 
     let dist = StandaloneDistribution::from_tar_zst(reader, temp_dir_path)?;
@@ -475,20 +503,26 @@ pub fn python_distribution_licenses(path: &str) -> Result<()> {
                 println!();
             }
 
-            if variant.license_public_domain.is_some() && variant.license_public_domain.unwrap() {
-                println!("Licenses: Public Domain");
-            } else if let Some(ref licenses) = variant.licenses {
-                println!(
-                    "Licenses: {}",
-                    itertools::join(licenses.iter().flat_map(|x| &x.licenses), ", ")
-                );
-                for li in licenses {
-                    for license in &li.licenses {
-                        println!("License Info: https://spdx.org/licenses/{}.html", license);
+            if let Some(component) = &variant.license {
+                match component.license() {
+                    LicenseFlavor::Spdx(expression) => {
+                        println!("Licensing: Valid SPDX: {}", expression);
+                    }
+                    LicenseFlavor::OtherExpression(expression) => {
+                        println!("Licensing: Invalid SPDX: {}", expression);
+                    }
+                    LicenseFlavor::PublicDomain => {
+                        println!("Licensing: Public Domain");
+                    }
+                    LicenseFlavor::None => {
+                        println!("Licensing: None defined");
+                    }
+                    LicenseFlavor::Unknown(terms) => {
+                        println!("Licensing: {}", terms.join(", "));
                     }
                 }
             } else {
-                println!("Licenses: UNKNOWN");
+                println!("Licensing: UNKNOWN");
             }
 
             println!();

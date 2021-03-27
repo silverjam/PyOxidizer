@@ -9,7 +9,7 @@ Defining and manipulating Python distributions.
 use {
     super::{
         binary::{LibpythonLinkMode, PythonBinaryBuilder},
-        config::EmbeddedPythonConfig,
+        config::PyembedPythonInterpreterConfig,
         standalone_distribution::StandaloneDistribution,
     },
     crate::python_distributions::PYTHON_DISTRIBUTIONS,
@@ -31,6 +31,8 @@ use {
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
     },
+    tugger_common::http::get_http_client,
+    tugger_file_manifest::FileData,
     url::Url,
     uuid::Uuid,
 };
@@ -66,6 +68,19 @@ pub struct PythonDistributionRecord {
 
     /// Whether the distribution can load prebuilt extension modules.
     pub supports_prebuilt_extension_modules: bool,
+}
+
+/// Describes Apple SDK build/targeting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppleSdkInfo {
+    /// Canonical name of Apple SDK used.
+    pub canonical_name: String,
+    /// Name of SDK platform being targeted.
+    pub platform: String,
+    /// Version of Apple SDK used.
+    pub version: String,
+    /// Deployment target version used.
+    pub deployment_target: String,
 }
 
 /// Describes a generic Python distribution.
@@ -124,6 +139,9 @@ pub trait PythonDistribution {
     /// Obtain Python packages in the standard library that provide tests.
     fn stdlib_test_packages(&self) -> Vec<String>;
 
+    /// Obtain Apple SDK settings for this distribution.
+    fn apple_sdk_info(&self) -> Option<&AppleSdkInfo>;
+
     /// Create a `PythonBytecodeCompiler` from this instance.
     fn create_bytecode_compiler(&self) -> Result<Box<dyn PythonBytecodeCompiler>>;
 
@@ -131,7 +149,7 @@ pub trait PythonDistribution {
     fn create_packaging_policy(&self) -> Result<PythonPackagingPolicy>;
 
     /// Construct an `EmbeddedPythonConfig` derived from this instance.
-    fn create_python_interpreter_config(&self) -> Result<EmbeddedPythonConfig>;
+    fn create_python_interpreter_config(&self) -> Result<PyembedPythonInterpreterConfig>;
 
     /// Obtain a `PythonBinaryBuilder` for constructing an executable embedding Python.
     ///
@@ -148,7 +166,7 @@ pub trait PythonDistribution {
         name: &str,
         libpython_link_mode: BinaryLibpythonLinkMode,
         policy: &PythonPackagingPolicy,
-        config: &EmbeddedPythonConfig,
+        config: &PyembedPythonInterpreterConfig,
         host_distribution: Option<Arc<dyn PythonDistribution>>,
     ) -> Result<Box<dyn PythonBinaryBuilder>>;
 
@@ -196,6 +214,17 @@ pub trait PythonDistribution {
 
         false
     }
+
+    /// Obtain support files for tcl/tk.
+    ///
+    /// The returned list of files contains relative file names and the locations
+    /// of file content. If the files are installed in a new directory, it should
+    /// be possible to use that directory joined with `tcl_library_path_directory`
+    /// as the value of `TCL_LIBRARY`.
+    fn tcl_files(&self) -> Result<Vec<(PathBuf, FileData)>>;
+
+    /// The name of the directory to use for `TCL_LIBRARY`
+    fn tcl_library_path_directory(&self) -> Option<String>;
 }
 
 /// Multiple threads or processes could race to extract the archive.
@@ -229,7 +258,7 @@ impl Drop for DistributionExtractLock {
     }
 }
 
-fn sha256_path(path: &PathBuf) -> Vec<u8> {
+fn sha256_path(path: &Path) -> Vec<u8> {
     let mut hasher = Sha256::new();
     let fh = File::open(&path).unwrap();
     let mut reader = std::io::BufReader::new(fh);
@@ -245,32 +274,6 @@ fn sha256_path(path: &PathBuf) -> Vec<u8> {
     }
 
     hasher.finalize().to_vec()
-}
-
-pub fn get_http_client() -> reqwest::Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::ClientBuilder::new();
-
-    for (key, value) in std::env::vars() {
-        let key = key.to_lowercase();
-        if key.ends_with("_proxy") {
-            let end = key.len() - "_proxy".len();
-            let schema = &key[..end];
-
-            if let Ok(url) = Url::parse(&value) {
-                if let Some(proxy) = match schema {
-                    "http" => Some(reqwest::Proxy::http(url.as_str())),
-                    "https" => Some(reqwest::Proxy::https(url.as_str())),
-                    _ => None,
-                } {
-                    if let Ok(proxy) = proxy {
-                        builder = builder.proxy(proxy);
-                    }
-                }
-            }
-        }
-    }
-
-    builder.build()
 }
 
 /// Ensure a Python distribution at a URL is available in a local directory.
@@ -335,7 +338,7 @@ pub fn download_distribution(url: &str, sha256: &str, cache_dir: &Path) -> Resul
     Ok(cache_path)
 }
 
-pub fn copy_local_distribution(path: &PathBuf, sha256: &str, cache_dir: &Path) -> Result<PathBuf> {
+pub fn copy_local_distribution(path: &Path, sha256: &str, cache_dir: &Path) -> Result<PathBuf> {
     let expected_hash = hex::decode(sha256)?;
     let basename = path.file_name().unwrap().to_str().unwrap().to_string();
     let cache_path = cache_dir.join(basename);

@@ -85,10 +85,13 @@ fn build_with_pyoxidizer_native(resolve_target: Option<&str>) {
 }
 */
 
+#[allow(clippy::if_same_then_else)]
 fn main() {
     let mut library_mode = "pyembed";
 
-    if env::var("CARGO_FEATURE_BUILD_MODE_STANDALONE").is_ok() {
+    if env::var("CARGO_FEATURE_BUILD_MODE_DEFAULT").is_ok() {
+    } else if env::var("CARGO_FEATURE_BUILD_MODE_STANDALONE").is_ok() {
+    } else if env::var("CARGO_FEATURE_BUILD_MODE_TEST").is_ok() {
     } else if env::var("CARGO_FEATURE_BUILD_MODE_PYOXIDIZER_EXE").is_ok() {
         let target = if let Ok(target) = env::var("PYOXIDIZER_BUILD_TARGET") {
             Some(target)
@@ -119,14 +122,16 @@ fn main() {
         build_with_artifacts_in_dir(&artifact_dir_path);
     } else if env::var("CARGO_FEATURE_BUILD_MODE_EXTENSION_MODULE").is_ok() {
         library_mode = "extension";
-    } else if env::var("CARGO_FEATURE_BUILD_MODE_TEST").is_ok() {
-        println!(
-            "cargo:rustc-env=PYEMBED_TESTS_DIR={}/src/test",
-            env::var("CARGO_MANIFEST_DIR").unwrap()
-        );
     } else {
         panic!("build-mode-* feature not set");
     }
+
+    // We're always able to derive this. So always set it, even though it is likely
+    // only used by test mode.
+    println!(
+        "cargo:rustc-env=PYEMBED_TESTS_DIR={}/src/test",
+        env::var("CARGO_MANIFEST_DIR").unwrap()
+    );
 
     println!("cargo:rustc-cfg=library_mode=\"{}\"", library_mode);
 }
