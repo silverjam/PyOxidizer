@@ -188,17 +188,19 @@ pub fn resolve_environment() -> Result<Environment> {
 
     let pyoxidizer_source = match Repository::discover(&exe_path) {
         Ok(repo) => {
+            /*
             let head = repo.head().unwrap();
             let commit = head.peel_to_commit().unwrap();
             let root = find_root_git_commit(commit.clone());
-
             if root.id().to_string() == ROOT_COMMIT {
+            */
                 PyOxidizerSource::LocalPath {
                     path: canonicalize_path(
                         repo.workdir()
                             .ok_or_else(|| anyhow!("unable to resolve Git workdir"))?,
                     )?,
                 }
+            /*
             } else {
                 // The pyoxidizer binary is in a directory that is in a Git repo that isn't
                 // pyoxidizer's. This could happen if running `pyoxidizer` from another
@@ -207,6 +209,7 @@ pub fn resolve_environment() -> Result<Environment> {
                 // returning info embedded in the build.
                 built_git_url()
             }
+            */
         }
         Err(_) => {
             // We're not running from a Git repo. Point to the canonical repo for the Git commit
